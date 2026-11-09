@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-11-09
+
+### Added
+- **`endpoint_exists(addr) -> bool`**: is there a server at `addr` right now? One
+  syscall that connects nothing (`WaitNamedPipeW(NMPWAIT_NOWAIT)` on Windows, a
+  stat of the socket file on unix). `request` retries a missing name for its
+  whole 30 s deadline, which is right for a client started before its server
+  and wrong for a host probing an application that may have bound no channel
+  (atrium without `--allow-ctl`); the fwterm client hit that stall.
+
 ### Fixed
 - Test only: `tests_accept::a_connect_flood_against_a_stalled_loop_is_bounded_at_the_door`
   flaked on Linux. It wanted every refused client to have *read* the busy

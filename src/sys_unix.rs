@@ -831,6 +831,17 @@ pub fn request(addr: &str, req: &str) -> io::Result<String> {
     request_with(addr, req, REPLY_STALL, REPLY_DEADLINE)
 }
 
+/// Does a server hold `addr` right now? The socket file exists and is a
+/// socket (the listener unlinks it on drop). A stale file left by a crash
+/// says yes; the first `request` then fails at once with a refused
+/// connection, which a host treats the same way.
+pub fn endpoint_exists(addr: &str) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    std::fs::metadata(addr)
+        .map(|m| m.file_type().is_socket())
+        .unwrap_or(false)
+}
+
 /// A request the server may hold for up to `hold` before answering: the
 /// stall and total budgets are each extended by it, nothing else differs.
 pub fn request_held(addr: &str, req: &str, hold: Duration) -> io::Result<String> {

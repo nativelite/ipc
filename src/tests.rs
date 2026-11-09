@@ -467,3 +467,13 @@ fn a_held_client_that_hangs_up_is_reported_and_its_hold_freed() {
         io::ErrorKind::NotFound
     );
 }
+
+#[test]
+fn endpoint_exists_answers_without_connecting() {
+    let addr = test_addr(9501);
+    assert!(!endpoint_exists(&addr), "nothing bound yet");
+    let listener = Listener::bind(&addr).expect("bind");
+    assert!(endpoint_exists(&addr), "a bound endpoint is seen");
+    drop(listener);
+    assert!(!endpoint_exists(&addr), "gone once the listener drops");
+}

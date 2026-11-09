@@ -94,6 +94,7 @@ extern "system" {
         sec: *mut c_void,
     ) -> Handle;
     fn ConnectNamedPipe(handle: Handle, overlapped: *mut c_void) -> i32;
+    fn WaitNamedPipeW(name: *const u16, timeout: u32) -> i32;
     fn DisconnectNamedPipe(handle: Handle) -> i32;
     fn CreateFileW(
         name: *const u16,
@@ -316,6 +317,8 @@ const GENERIC_READ: u32 = 0x8000_0000;
 const GENERIC_WRITE: u32 = 0x4000_0000;
 const OPEN_EXISTING: u32 = 3;
 const ERROR_FILE_NOT_FOUND: i32 = 2;
+/// `WaitNamedPipeW`: return at once.
+const NMPWAIT_NOWAIT: u32 = 1;
 const ERROR_PIPE_BUSY: i32 = 231;
 const ERROR_NO_DATA: i32 = 232;
 const ERROR_BROKEN_PIPE: i32 = 109;
@@ -1139,6 +1142,22 @@ impl Drop for Listener {
 
 pub fn request(addr: &str, req: &str) -> io::Result<String> {
     request_with(addr, req, REPLY_STALL, REPLY_DEADLINE)
+}
+
+/// Does a server hold `addr` right now? One `WaitNamedPipeW` with no wait,
+/// which connects nothing: `ERROR_FILE_NOT_FOUND` is "no endpoint"; success,
+/// or `ERROR_SEM_TIMEOUT` (the name exists and every instance is busy), is
+/// "yes". `request` keeps retrying a missing name for its whole deadline,
+/// which is right for `atrium ctl` started before its atrium and wrong for a
+/// host that only wants to know whether to ask.
+pub fn endpoint_exists(addr: &str) -> bool {
+    let name = wide(addr);
+    // SAFETY: `name` is a NUL-terminated wide string alive for the call.
+    let ok = unsafe { WaitNamedPipeW(name.as_ptr(), NMPWAIT_NOWAIT) };
+    if ok != 0 {
+        return true;
+    }
+    io::Error::last_os_error().raw_os_error() != Some(ERROR_FILE_NOT_FOUND)
 }
 
 /// A request the server may hold for up to `hold` before answering: the

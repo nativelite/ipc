@@ -1,6 +1,6 @@
 [package]
 name = "nativelite-ipc"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 rust-version = "1.70"
 description = "A local, same-user, one-line-request/one-line-reply control channel: a Windows named pipe or a unix socket, served non-blocking from a run loop, with the hardening a hostile client made necessary. Standard library only."

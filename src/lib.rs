@@ -276,6 +276,16 @@ pub fn request(addr: &str, req: &str) -> io::Result<String> {
     sys::request(addr, req)
 }
 
+/// Is there a server at `addr` right now? One syscall, connects nothing:
+/// `WaitNamedPipeW(NMPWAIT_NOWAIT)` on Windows, a stat of the socket file on
+/// unix. For a host that probes an application which may not have bound a
+/// channel at all (atrium without `--allow-ctl`): [`request`] retries a
+/// missing name for its whole deadline, right for a client started before
+/// its server and wrong for a probe.
+pub fn endpoint_exists(addr: &str) -> bool {
+    sys::endpoint_exists(addr)
+}
+
 /// [`request`] for a verb the server may hold ([`Listener::park`]) for up to
 /// `hold` before answering: the client's stall and total budgets are each
 /// extended by `hold`, so a silent server is still a timeout — just a later
