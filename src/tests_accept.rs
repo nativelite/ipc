@@ -69,39 +69,73 @@ fn a_connect_flood_against_a_stalled_loop_is_bounded_at_the_door() {
         })
         .collect();
 
-    // Every connection was either handed over (at most HANDOVER_CAP) or
-    // refused at the door — none is left in limbo.
-    within(
-        Duration::from_secs(20),
-        "the flood was accounted for",
-        || server.refused_at_door() + HANDOVER_CAP >= FLOOD,
-    );
+    // Count only once every client has resolved on its own: a queued one
+    // waits out its stall budget (REPLY_STALL, 5 s) and a refused one is cut
+    // off at once. Until then a client may still sit in the kernel's listen
+    // backlog, neither queued nor refused, and the counters are not final.
+    let outcomes = join_all(clients, Duration::from_secs(10), "flood clients");
+    // Each successful hand-over rings exactly once, so the rings are the
+    // connections the never-polled loop is holding: at most HANDOVER_CAP, and
+    // every other client was refused at the door — an exact split, not a floor.
+    let queued = rings.load(Ordering::SeqCst);
     let refused = server.refused_at_door();
     assert!(
-        refused >= FLOOD - HANDOVER_CAP,
-        "{refused} refused: more than HANDOVER_CAP connections are queued"
+        queued <= HANDOVER_CAP,
+        "{queued} connections queued behind the loop; the hand-over holds {HANDOVER_CAP}"
     );
-    assert!(
-        rings.load(Ordering::SeqCst) <= HANDOVER_CAP,
-        "a refused client must not ring the loop"
+    assert_eq!(
+        refused + queued,
+        FLOOD,
+        "every client was either queued or refused at the door"
     );
 
-    let outcomes = join_all(clients, Duration::from_secs(30), "flood clients");
-    // A refused client was told so (unix) or saw EOF (Windows: the disconnect
-    // would discard a reply, so none is written); a queued one timed out on
-    // its own budget. No client was answered `ok`.
-    let told = outcomes
-        .iter()
-        .filter(|o| matches!(o, Ok(r) if r.contains("server busy")))
-        .count();
-    let errored = outcomes.iter().filter(|o| o.is_err()).count();
-    assert_eq!(told + errored, FLOOD, "{outcomes:?}");
+    // What the clients saw. No client was answered `ok`. A queued one timed
+    // out on its own budget. A refused one either read the busy refusal
+    // (unix, when its request had landed before the refusal) or saw the
+    // connection cut: on Linux a client whose request had NOT yet been
+    // written when the server closed gets EPIPE on that write and never
+    // reads the refusal sitting in its receive buffer — a race of the
+    // client's making, not a leak of the server's; on Windows the pipe is
+    // disconnected without a reply (one would be discarded) and the client
+    // sees the pipe fail, or times out writing into it (ERROR_NO_DATA).
+    let mut kinds: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut told = 0;
+    let mut answered_ok = 0;
+    for o in &outcomes {
+        match o {
+            Ok(r) if r.contains("server busy") => told += 1,
+            Ok(r) => {
+                answered_ok += 1;
+                eprintln!("unexpected reply: {r}");
+            }
+            Err(e) => *kinds.entry(format!("{:?}", e.kind())).or_default() += 1,
+        }
+    }
+    assert_eq!(answered_ok, 0, "a never-polled server answered a client");
+    // On stderr for `--nocapture`: how the flood resolved on this machine.
+    eprintln!("flood: queued={queued} refused={refused} told={told} errors={kinds:?}");
+    let timed_out = kinds.get("TimedOut").copied().unwrap_or(0);
+    let cut = outcomes.len() - told - timed_out;
+    assert!(
+        timed_out >= queued,
+        "the {queued} queued clients must have waited out their budget; outcomes: told={told} {kinds:?}"
+    );
     if cfg!(unix) {
+        // Only the queued clients wait: a refused one is told or cut at once.
+        assert_eq!(
+            timed_out, queued,
+            "a refused client must not wait out a budget; outcomes: told={told} {kinds:?}"
+        );
         assert!(
-            told >= FLOOD - HANDOVER_CAP,
-            "unix refusals carry the reason: {told}"
+            told > 0,
+            "the refusal never reached a client; outcomes: {kinds:?}"
         );
     }
+    assert_eq!(
+        told + cut + (timed_out - queued),
+        refused,
+        "refused clients: told={told} cut={cut} timed_out={timed_out} queued={queued} {kinds:?}"
+    );
     drop(server);
 }
 

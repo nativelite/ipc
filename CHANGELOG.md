@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Test only: `tests_accept::a_connect_flood_against_a_stalled_loop_is_bounded_at_the_door`
+  flaked on Linux. It wanted every refused client to have *read* the busy
+  refusal, but a client the server closes before its request write lands gets
+  EPIPE on that write and never reads the refusal waiting in its receive
+  buffer — a race on the client's side, not a server leak. The test now lets
+  every client resolve, then checks the exact split `refused + queued == 200`
+  (queued = the rings, at most `HANDOVER_CAP`), that only the queued clients
+  waited out a budget, and that each refused one was told or cut.
 - **The never-reads test no longer races the scheduler** (atrium issue #9).
   `neither_poll_nor_respond_waits_on_a_client_that_never_reads` asserted that
   every `poll` and `respond` returned inside 50 ms, which a parallel cargo
