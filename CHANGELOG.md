@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-08
+
 ### Added
 - **`Listener::bind_waking(addr, wake)`: the run loop is woken on connect.**
   An accept thread blocks on the endpoint (a blocking `accept` on unix; on
