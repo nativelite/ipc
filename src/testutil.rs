@@ -57,6 +57,7 @@ pub fn shipping_source() -> &'static str {
             include_str!("lib.rs"),
             include_str!("wire.rs"),
             include_str!("chan.rs"),
+            include_str!("hold.rs"),
             include_str!("winmap.rs"),
             include_str!("sys_windows.rs"),
             include_str!("sys_unix.rs"),

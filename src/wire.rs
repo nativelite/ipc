@@ -102,6 +102,33 @@ pub const REFUSAL_REPORT_EVERY: Duration = Duration::from_secs(1);
 /// not just see the socket close.
 pub const OVERSIZE_REPLY: &str = r#"{"ok":false,"err":"request exceeded 65536 bytes"}"#;
 
+// -- held requests ("respond later") -------------------------------------
+//
+// A server may take a request off the one-at-a-time latch and answer it on a
+// later tick (`Listener::park` / `respond_parked`): a long-lived `inbox --wait`
+// that is answered the moment a delivery lands, instead of a poll every 1.5 s.
+// A held connection is still a connection the server is holding open on a
+// client's behalf, so it has a deadline and the pool of them has a cap.
+
+/// How long a held request may wait for its reply. Past this the server
+/// answers [`HOLD_EXPIRED_REPLY`] and closes, so a client that is still there
+/// simply asks again. The client of a held request budgets for this
+/// ([`crate::request_held`]).
+pub const HOLD_DEADLINE: Duration = Duration::from_secs(60);
+/// How many requests may be held at once. Past this `park` refuses the newest
+/// with [`HOLD_FULL_REPLY`], so a flood of waiters cannot pin every connection
+/// the server will ever hold open.
+pub const MAX_HELD: usize = 64;
+/// What a held client hears when its hold ran out unanswered.
+pub const HOLD_EXPIRED_REPLY: &str = r#"{"ok":false,"err":"held request timed out; ask again"}"#;
+/// What a would-be held client hears when the hold pool is full.
+pub const HOLD_FULL_REPLY: &str = r#"{"ok":false,"err":"too many held requests; ask again"}"#;
+/// How long the accept thread (`Listener::bind_waking`) waits before retrying
+/// an OS call that failed for want of a resource (a pipe instance that could
+/// not be created, an `accept` that returned an error), so a persistent
+/// failure costs a nap per attempt rather than a spinning core.
+pub const ACCEPT_RETRY: Duration = Duration::from_millis(50);
+
 /// The error `respond` hands back for a reply over [`MAX_REPLY`]. One
 /// function rather than one copy per platform: this file already shipped a
 /// cap the writer did not know about, and two hand-written copies of the

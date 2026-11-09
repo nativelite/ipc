@@ -18,6 +18,18 @@
 //!   [`respond`](Listener::respond) before the next `poll` yields another — but
 //!   several half-open clients are accepted and parked concurrently, so no
 //!   single stalled connection can wedge the channel.
+//! * [`Listener::bind_waking`] — the same, plus an accept thread that rings a
+//!   caller-supplied waker the moment a client connects, so a run loop that
+//!   sleeps on a doorbell is woken for a request instead of finding it on its
+//!   next tick, and nothing is retried per tick to notice a connect. `poll`
+//!   keeps its contract and the loop keeps polling as its fallback.
+//! * [`Listener::park`] / [`Listener::respond_parked`] — answer later. A
+//!   request the server cannot answer yet (an `inbox --wait` with nothing
+//!   queued) is taken off the one-at-a-time latch under a [`Ticket`] and
+//!   answered on a later tick, through the same never-blocking path. Held
+//!   requests have a deadline ([`HOLD_DEADLINE`], after which the client is
+//!   refused and asks again) and a cap, and [`request_held`] is the client
+//!   that budgets for the wait.
 //! * [`request`] — the client: connect, send one line, read one reply line.
 //!
 //! Framing is one `\n`-terminated line each way. This is a control plane for a
@@ -99,6 +111,26 @@ impl Listener {
         })
     }
 
+    /// [`bind`](Listener::bind), plus an accept thread that calls `wake` each
+    /// time a client connects. The thread blocks on the endpoint (a blocking
+    /// `accept` on unix; on Windows a blocking pipe instance of its own, the
+    /// first instance with the same SDDL and first-instance flag as `bind`
+    /// creates), hands the connection to the listener for the next
+    /// [`poll`](Listener::poll) to read, rings, and blocks again. The waker
+    /// runs on that thread, so it must be cheap and must not take a lock the
+    /// run loop holds while polling — a doorbell `try_send` is the intended
+    /// shape. Nothing else changes: the peer check, the slot pool and its
+    /// deadlines run on the polling thread as before. Dropping the listener
+    /// stops the thread without waiting on a client.
+    pub fn bind_waking(
+        addr: &str,
+        wake: Box<dyn Fn() + Send + Sync + 'static>,
+    ) -> io::Result<Listener> {
+        Ok(Listener {
+            sys: sys::Listener::bind_waking(addr, wake)?,
+        })
+    }
+
     /// Non-blocking: the next complete request line if one has arrived, else
     /// `Ok(None)`. After a `Some(_)` the caller SHOULD call
     /// [`respond`](Listener::respond) before polling again — that is the
@@ -137,6 +169,47 @@ impl Listener {
     ///   EOF before a newline, which its `read_reply` reports as an error.
     pub fn respond(&mut self, reply: &str) -> io::Result<()> {
         self.sys.respond(reply)
+    }
+
+    /// Answer later: take the request the last [`poll`](Listener::poll)
+    /// returned off the one-at-a-time latch and hold its connection under the
+    /// returned [`Ticket`], so the next `poll` yields the next request. Answer
+    /// it with [`respond_parked`](Listener::respond_parked).
+    ///
+    /// `None` when there is nothing to park (no request outstanding) or when
+    /// [`MAX_HELD`] requests are already held — then the client has been
+    /// refused, `{"ok":false,"err":"too many held requests; ask again"}`, so it
+    /// re-asks, and no earlier waiter was evicted. A held connection counts
+    /// toward the same bounds as any other the server keeps open.
+    ///
+    /// A hold lasts at most [`HOLD_DEADLINE`]. When it runs out the ticket is
+    /// reported through [`take_expired`](Listener::take_expired) and the
+    /// server has until its next `poll` to answer it itself; after that the
+    /// client is refused with `{"ok":false,"err":"held request timed out; ask
+    /// again"}` and the connection closed. A held client that hangs up frees
+    /// its slot at once and is reported the same way.
+    pub fn park(&mut self) -> Option<Ticket> {
+        self.sys.park()
+    }
+
+    /// Send the reply line for a held request, through the same never-blocking
+    /// path as [`respond`](Listener::respond) (same size cap, same errors).
+    /// `NotFound` when the ticket is no longer held: already answered, timed
+    /// out, or its client left.
+    pub fn respond_parked(&mut self, ticket: Ticket, reply: &str) -> io::Result<()> {
+        self.sys.respond_parked(ticket, reply)
+    }
+
+    /// The tickets whose hold ended since the last call — past the deadline
+    /// (answer now, or the next `poll` refuses them) or their client left
+    /// (nothing to answer) — so the server can forget what it was waiting on.
+    pub fn take_expired(&mut self) -> Vec<Ticket> {
+        self.sys.take_expired()
+    }
+
+    /// How many requests are held for a later answer.
+    pub fn held_len(&self) -> usize {
+        self.sys.held_len()
     }
 
     /// Take the last endpoint-integrity alarm, if one fired.
@@ -181,8 +254,25 @@ pub fn request(addr: &str, req: &str) -> io::Result<String> {
     sys::request(addr, req)
 }
 
+/// [`request`] for a verb the server may hold ([`Listener::park`]) for up to
+/// `hold` before answering: the client's stall and total budgets are each
+/// extended by `hold`, so a silent server is still a timeout — just a later
+/// one. Pass [`HOLD_DEADLINE`] to cover the server's full hold.
+pub fn request_held(addr: &str, req: &str, hold: std::time::Duration) -> io::Result<String> {
+    sys::request_held(addr, req, hold)
+}
+
+pub use hold::Ticket;
+/// How long a server holds a parked request before refusing it; what a client
+/// of such a verb passes to [`request_held`].
+pub const HOLD_DEADLINE: std::time::Duration = wire::HOLD_DEADLINE;
+/// How many requests a server holds at once before `park` refuses the newest.
+pub const MAX_HELD: usize = wire::MAX_HELD;
+
 #[allow(dead_code)]
 mod chan;
+#[allow(dead_code)]
+mod hold;
 #[allow(dead_code)]
 mod winmap;
 #[allow(dead_code)]

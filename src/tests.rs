@@ -277,3 +277,193 @@ fn poll_is_non_blocking_when_idle() {
         assert_eq!(server.poll().expect("poll"), None);
     }
 }
+
+/// Serve until `poll` yields a request, ticking like the run loop does.
+fn next_request(server: &mut Listener, ticks: usize) -> Option<String> {
+    for _ in 0..ticks {
+        if let Some(req) = server.poll().expect("poll") {
+            return Some(req);
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    None
+}
+
+/// **The doorbell.** A listener bound with `bind_waking` rings the waker when
+/// a client connects, before and without the server polling: the accept
+/// thread is what notices the connect. Then the ordinary poll/respond serves
+/// the request the thread handed over, and the client sees its reply.
+#[test]
+fn bind_waking_rings_on_connect_without_a_poll() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let addr = test_addr(3);
+    let rings = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&rings);
+    let mut server = Listener::bind_waking(
+        &addr,
+        Box::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }),
+    )
+    .expect("bind_waking");
+
+    let addr2 = addr.clone();
+    let client = thread::spawn(move || request(&addr2, r#"{"cmd":"list"}"#).expect("request"));
+
+    // No poll yet: the ring must come from the thread.
+    let t = Instant::now();
+    while rings.load(Ordering::SeqCst) == 0 {
+        assert!(
+            t.elapsed() < Duration::from_secs(5),
+            "the waker never rang for a connect"
+        );
+        thread::sleep(Duration::from_millis(2));
+    }
+
+    let req = next_request(&mut server, 400).expect("the connected client's request");
+    assert!(req.contains("\"list\""), "server saw: {req}");
+    server.respond(r#"{"ok":true,"tree":[]}"#).expect("respond");
+    for _ in 0..200 {
+        let _ = server.poll();
+        thread::sleep(Duration::from_millis(2));
+    }
+    let reply = client.join().expect("client thread");
+    assert!(reply.contains("\"ok\":true"), "client saw: {reply}");
+    assert_eq!(rings.load(Ordering::SeqCst), 1, "one connect, one ring");
+
+    // A second client, to show the thread went back to waiting.
+    let addr3 = addr.clone();
+    let client = thread::spawn(move || request(&addr3, r#"{"cmd":"list"}"#).expect("request"));
+    let req = next_request(&mut server, 400).expect("the second request");
+    assert!(req.contains("\"list\""));
+    server.respond(r#"{"ok":true}"#).expect("respond");
+    for _ in 0..200 {
+        let _ = server.poll();
+        thread::sleep(Duration::from_millis(2));
+    }
+    assert!(client.join().expect("client").contains("\"ok\":true"));
+    assert_eq!(rings.load(Ordering::SeqCst), 2);
+}
+
+/// Dropping a waking listener stops its accept thread promptly, with no
+/// client ever having connected — the thread is blocked in the OS wait and
+/// `Drop` has to get it out.
+#[test]
+fn dropping_a_waking_listener_does_not_hang_on_its_accept_thread() {
+    let addr = test_addr(4);
+    let server = Listener::bind_waking(&addr, Box::new(|| {})).expect("bind_waking");
+    let dropper = thread::spawn(move || drop(server));
+    let t = Instant::now();
+    while !dropper.is_finished() {
+        assert!(
+            t.elapsed() < Duration::from_secs(5),
+            "Drop hung waiting for the accept thread"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    dropper.join().expect("drop");
+}
+
+/// **Answer later.** A parked request leaves the latch (the next `poll`
+/// yields another client's request), waits across polls, and is answered
+/// through `respond_parked` with the same reply path; the client, which used
+/// `request_held`, sees the reply when it comes.
+#[test]
+fn a_parked_request_is_answered_later_and_does_not_block_the_channel() {
+    let addr = test_addr(5);
+    let mut server = Listener::bind(&addr).expect("bind");
+
+    let addr_w = addr.clone();
+    let waiter = thread::spawn(move || {
+        request_held(&addr_w, r#"{"cmd":"inbox","wait":true}"#, HOLD_DEADLINE).expect("held")
+    });
+    let req = next_request(&mut server, 400).expect("the waiter's request");
+    assert!(req.contains("\"wait\":true"));
+    let ticket = server.park().expect("parked");
+    assert_eq!(server.held_len(), 1);
+
+    // The channel keeps serving while the hold stands.
+    let addr_o = addr.clone();
+    let other = thread::spawn(move || request(&addr_o, r#"{"cmd":"list"}"#).expect("request"));
+    let req = next_request(&mut server, 400).expect("the other request");
+    assert!(
+        req.contains("\"list\""),
+        "parked request did not leave the latch: {req}"
+    );
+    server.respond(r#"{"ok":true,"tree":[]}"#).expect("respond");
+    for _ in 0..100 {
+        let _ = server.poll();
+        thread::sleep(Duration::from_millis(2));
+    }
+    assert!(other.join().expect("other").contains("\"tree\""));
+    assert!(!waiter.is_finished(), "the waiter must still be waiting");
+    assert!(server.take_expired().is_empty(), "well inside the deadline");
+
+    // Now the answer.
+    server
+        .respond_parked(
+            ticket,
+            r#"{"ok":true,"items":[{"kind":"send","text":"go"}]}"#,
+        )
+        .expect("respond_parked");
+    assert_eq!(server.held_len(), 0);
+    for _ in 0..200 {
+        let _ = server.poll();
+        thread::sleep(Duration::from_millis(2));
+    }
+    let reply = waiter.join().expect("waiter");
+    assert!(reply.contains("\"text\":\"go\""), "waiter saw: {reply}");
+
+    // A ticket answers once.
+    let again = server
+        .respond_parked(ticket, "{}")
+        .expect_err("stale ticket");
+    assert_eq!(again.kind(), io::ErrorKind::NotFound);
+    assert!(server.park().is_none(), "nothing outstanding to park");
+}
+
+/// A held client that gives up (its process is killed, its own timeout) frees
+/// its hold the next time the server looks, and the ticket is reported so
+/// the server forgets it — long before the hold deadline.
+#[test]
+fn a_held_client_that_hangs_up_is_reported_and_its_hold_freed() {
+    let addr = test_addr(6);
+    let mut server = Listener::bind(&addr).expect("bind");
+    let addr_w = addr.clone();
+    // A client with a short budget: it leaves on its own.
+    let waiter = thread::spawn(move || {
+        request_held(
+            &addr_w,
+            r#"{"cmd":"inbox","wait":true}"#,
+            Duration::from_millis(0),
+        )
+    });
+    next_request(&mut server, 400).expect("the waiter's request");
+    let ticket = server.park().expect("parked");
+    // The client's budget is REPLY_STALL (5 s) with a zero hold; wait it out.
+    let gone = waiter.join().expect("waiter");
+    assert!(gone.is_err(), "the client gave up on its own: {gone:?}");
+    let t = Instant::now();
+    loop {
+        let _ = server.poll();
+        let lapsed = server.take_expired();
+        if lapsed.contains(&ticket) {
+            break;
+        }
+        assert!(
+            t.elapsed() < Duration::from_secs(5),
+            "a departed held client was never reported"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(server.held_len(), 0);
+    assert_eq!(
+        server
+            .respond_parked(ticket, "{}")
+            .expect_err("gone")
+            .kind(),
+        io::ErrorKind::NotFound
+    );
+}

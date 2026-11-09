@@ -2,10 +2,12 @@
 // Unix: a non-blocking `UnixListener` and a bounded pool of half-open clients.
 // ---------------------------------------------------------------------------
 use super::chan::{Channel, Conn, ReadOutcome, Recv, Sent, WriteOutcome};
+use super::hold::{Held, Ticket};
 use super::wire::{
-    expired, reply_too_large, ACCEPT_PER_TICK, CLIENT_POLL, DRAIN_DEADLINE, DRAIN_GRACE,
-    ENDPOINT_CHECK_EVERY, MAX_LINGER, MAX_OUTBOX, MAX_REPLY, MAX_SLOTS, OVERSIZE_REPLY,
-    REFUSAL_REPORT_EVERY, REPLY_DEADLINE, REPLY_STALL, TOO_LARGE_REPLY,
+    expired, reply_too_large, ACCEPT_PER_TICK, ACCEPT_RETRY, CLIENT_POLL, DRAIN_DEADLINE,
+    DRAIN_GRACE, ENDPOINT_CHECK_EVERY, HOLD_EXPIRED_REPLY, HOLD_FULL_REPLY, MAX_LINGER, MAX_OUTBOX,
+    MAX_REPLY, MAX_SLOTS, OVERSIZE_REPLY, REFUSAL_REPORT_EVERY, REPLY_DEADLINE, REPLY_STALL,
+    TOO_LARGE_REPLY,
 };
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
@@ -13,10 +15,115 @@ use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::Arc;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 extern "C" {
     fn geteuid() -> u32;
+    fn shutdown(fd: i32, how: i32) -> i32;
+}
+
+/// `SHUT_RDWR`: the same value on Linux, Android, macOS and the BSDs.
+const SHUT_RDWR: i32 = 2;
+
+/// The waker a [`Listener::bind_waking`] accept thread rings on each connect.
+pub type Wake = Box<dyn Fn() + Send + Sync + 'static>;
+
+/// The accept thread and the channel it hands accepted streams over.
+///
+/// `accept(2)` is the one call in this transport that can wait, so it gets a
+/// thread of its own: the thread blocks on the listening socket, forwards each
+/// accepted stream to the run loop over `rx`, rings the waker, and blocks
+/// again. Nothing else moves: the peer-uid gate, the slot pool and its
+/// eviction all still run in [`Listener::accept_new`] on the run loop, on the
+/// stream the thread forwarded instead of one `accept` returned — so the
+/// refusal path and its counters behave exactly as before.
+///
+/// `O_NONBLOCK` is a property of the open file description, shared by every
+/// dup of the socket, so the listener is set blocking as a whole and the run
+/// loop never calls `accept` on it in this mode.
+struct Acceptor {
+    rx: Receiver<UnixStream>,
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Acceptor {
+    fn start(listener: &UnixListener, wake: Wake) -> io::Result<Acceptor> {
+        let dup = listener.try_clone()?;
+        dup.set_nonblocking(false)?;
+        let (tx, rx) = mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        let thread = thread::Builder::new()
+            .name("ipc-accept".to_string())
+            .spawn(move || accept_loop(dup, tx, wake, flag))?;
+        Ok(Acceptor {
+            rx,
+            stop,
+            thread: Some(thread),
+        })
+    }
+
+    /// Ask the thread to leave and wait for it, briefly. `shutdown(2)` on the
+    /// listening socket wakes a blocked `accept` on Linux; where it does not
+    /// (macOS reports `ENOTCONN` and the wait stands), a connect to our own
+    /// path does. Both are attempted, and the join is bounded by a spin count
+    /// rather than a clock, so a thread that cannot be woken (the path was
+    /// taken over by another socket) is left to die with the process instead
+    /// of hanging the drop.
+    fn stop(&mut self, fd: i32, path: &Path) {
+        self.stop.store(true, Ordering::SeqCst);
+        // SAFETY: `fd` is the listener's open descriptor, borrowed for the
+        // call; shutdown on a listening socket either wakes `accept` or fails
+        // harmlessly, and either way touches nothing but that socket.
+        unsafe { shutdown(fd, SHUT_RDWR) };
+        let _ = UnixStream::connect(path);
+        let Some(thread) = self.thread.take() else {
+            return;
+        };
+        for _ in 0..1_000 {
+            if thread.is_finished() {
+                let _ = thread.join();
+                return;
+            }
+            thread::yield_now();
+        }
+        // Still blocked: detach. The thread holds only its dup of the socket.
+    }
+}
+
+/// The accept thread's body: block, forward, ring, repeat, until told to stop.
+fn accept_loop(listener: UnixListener, tx: Sender<UnixStream>, wake: Wake, stop: Arc<AtomicBool>) {
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            return;
+        }
+        match listener.accept() {
+            Ok((stream, _)) => {
+                if stop.load(Ordering::SeqCst) {
+                    return;
+                }
+                if tx.send(stream).is_err() {
+                    return; // the Listener is gone
+                }
+                wake();
+            }
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            // EMFILE, ECONNABORTED, the socket shut down from `Drop`: the
+            // stop flag decides whether this is the end; otherwise nap, so a
+            // persistent error is a slow loop and not a hot one.
+            Err(_) => {
+                if stop.load(Ordering::SeqCst) {
+                    return;
+                }
+                thread::sleep(ACCEPT_RETRY);
+            }
+        }
+    }
 }
 
 /// The effective uid of the connected peer, if the OS can report it. `None`
@@ -143,10 +250,23 @@ pub struct Listener {
     /// marks a *refused* client, which atrium keeps draining until it hangs up
     /// so the refusal is not lost to a reset (see `Channel::drain_input`).
     outbox: VecDeque<(Channel<Stream>, Option<Instant>)>,
+    /// Requests the caller took off the latch to answer later (`park`).
+    held: Held<Channel<Stream>>,
+    /// The accept thread, when bound with `bind_waking`; `None` means the run
+    /// loop accepts for itself, non-blocking, once per poll.
+    accept: Option<Acceptor>,
 }
 
 impl Listener {
     pub fn bind(addr: &str) -> io::Result<Listener> {
+        Self::bind_with(addr, None)
+    }
+
+    pub fn bind_waking(addr: &str, wake: Wake) -> io::Result<Listener> {
+        Self::bind_with(addr, Some(wake))
+    }
+
+    fn bind_with(addr: &str, wake: Option<Wake>) -> io::Result<Listener> {
         let path = PathBuf::from(addr);
         // A unix-domain socket path must fit in `sockaddr_un.sun_path`, which
         // holds fewer bytes on macOS/BSD (104, incl. the NUL) than on Linux
@@ -198,6 +318,20 @@ impl Listener {
             }
         }
         let ident = socket_ident(&path);
+        // The accept thread, if asked for: it needs the socket blocking, and
+        // a failure to start it is a failure to bind (the caller asked to be
+        // woken; silently polling instead would be the lie this crate exists
+        // to avoid).
+        let accept = match wake {
+            Some(wake) => match Acceptor::start(&listener, wake) {
+                Ok(a) => Some(a),
+                Err(e) => {
+                    let _ = std::fs::remove_file(&path);
+                    return Err(e);
+                }
+            },
+            None => None,
+        };
         Ok(Listener {
             listener,
             path,
@@ -210,7 +344,77 @@ impl Listener {
             refused: 0,
             refusal_reported: None,
             outbox: VecDeque::new(),
+            held: Held::new(),
+            accept,
         })
+    }
+
+    /// How many requests are held for a later answer. Tests and diagnostics.
+    pub fn held_len(&self) -> usize {
+        self.held.len()
+    }
+
+    /// Take the request the last `poll` returned off the latch, to answer it
+    /// later with [`respond_parked`](Listener::respond_parked). `None` when
+    /// nothing is outstanding, or when the hold pool is full — in which case
+    /// the client has already been refused with [`HOLD_FULL_REPLY`] and will
+    /// ask again.
+    pub fn park(&mut self) -> Option<Ticket> {
+        let now = Instant::now();
+        let mut ch = self.cur.take()?;
+        if self.held.is_full() {
+            ch.queue(HOLD_FULL_REPLY, now);
+            let _ = ch.pump_write(now);
+            let _ = self.park_reply(ch, None, now);
+            return None;
+        }
+        Some(self.held.park(ch, now))
+    }
+
+    /// Answer a held request through the same never-blocking path as
+    /// `respond`. `NotFound` for a ticket that is no longer held: answered,
+    /// timed out, or its client left.
+    pub fn respond_parked(&mut self, ticket: Ticket, reply: &str) -> io::Result<()> {
+        let Some(ch) = self.held.take(ticket) else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "no such held request: it was answered, timed out, or its client left",
+            ));
+        };
+        // Borrow the latch for the write without disturbing a request the
+        // caller may still owe an answer.
+        let outstanding = self.cur.replace(ch);
+        let r = self.respond(reply);
+        self.cur = outstanding;
+        r
+    }
+
+    /// Tickets whose hold is over since the last call; see `Held::take_expired`.
+    pub fn take_expired(&mut self) -> Vec<Ticket> {
+        self.held.take_expired()
+    }
+
+    /// Age the held requests: drop those whose client left, report the ones
+    /// past the deadline, and refuse the ones reported last time that are still
+    /// unanswered.
+    fn service_held(&mut self, now: Instant) {
+        if self.held.is_empty() {
+            return;
+        }
+        let mut buf = [0u8; 256];
+        // A held client sends nothing more (one request per connection), so a
+        // readable byte is either EOF — it left — or noise to ignore.
+        self.held.prune(|ch| {
+            matches!(
+                ch.pump_read(&mut buf, now),
+                ReadOutcome::Closed | ReadOutcome::Oversize
+            )
+        });
+        for mut ch in self.held.sweep(now) {
+            ch.queue(HOLD_EXPIRED_REPLY, now);
+            let _ = ch.pump_write(now);
+            let _ = self.park_reply(ch, None, now);
+        }
     }
 
     /// Re-`stat` the endpoint at most once a second and raise an alarm if the
@@ -374,7 +578,20 @@ impl Listener {
     /// healthy client from being *accepted*.
     fn accept_new(&mut self, now: Instant) -> io::Result<()> {
         for _ in 0..ACCEPT_PER_TICK {
-            match self.listener.accept() {
+            // Where the stream comes from is the only thing the accept thread
+            // changes: everything below runs on the run loop either way.
+            let accepted = match &self.accept {
+                Some(a) => match a.rx.try_recv() {
+                    Ok(stream) => Ok((stream, ())),
+                    Err(TryRecvError::Empty) => return Ok(()),
+                    // The thread is gone (it cannot be, short of a panic);
+                    // nothing more will ever arrive, which is idle, not an
+                    // error the run loop should see every tick.
+                    Err(TryRecvError::Disconnected) => return Ok(()),
+                },
+                None => self.listener.accept().map(|(s, _)| (s, ())),
+            };
+            match accepted {
                 Ok((stream, _)) => {
                     // Peer-cred gate, FAILING CLOSED: `None` — the case where
                     // the OS could not vouch for the peer at all — is exactly
@@ -422,6 +639,7 @@ impl Listener {
         self.check_endpoint(now);
         // Replies owed to earlier clients go out before new work comes in.
         self.service_outbox(now);
+        self.service_held(now);
         self.accept_new(now)?;
         self.report_refusals(now);
         debug_assert!(self.cur.is_none(), "released above");
@@ -517,6 +735,11 @@ impl Listener {
 
 impl Drop for Listener {
     fn drop(&mut self) {
+        // The accept thread first, while the path still names our socket (its
+        // wake-up is a connect to that path).
+        if let Some(mut a) = self.accept.take() {
+            a.stop(self.listener.as_raw_fd(), &self.path);
+        }
         // Only unlink the path if it is still *our* socket: if it was
         // hijacked, the file belongs to someone else and is not ours to
         // remove.
@@ -527,6 +750,16 @@ impl Drop for Listener {
 }
 
 pub fn request(addr: &str, req: &str) -> io::Result<String> {
+    request_with(addr, req, REPLY_STALL, REPLY_DEADLINE)
+}
+
+/// A request the server may hold for up to `hold` before answering: the
+/// stall and total budgets are each extended by it, nothing else differs.
+pub fn request_held(addr: &str, req: &str, hold: Duration) -> io::Result<String> {
+    request_with(addr, req, hold + REPLY_STALL, hold + REPLY_DEADLINE)
+}
+
+fn request_with(addr: &str, req: &str, stall: Duration, hard: Duration) -> io::Result<String> {
     let mut stream = UnixStream::connect(addr)?;
     // Non-blocking under deadlines computed ONCE — deliberately NOT
     // `set_read_timeout`/`set_write_timeout`. Two independent reasons, both
@@ -546,7 +779,7 @@ pub fn request(addr: &str, req: &str) -> io::Result<String> {
     //    argument` and threw away a COMPLETE reply. `fcntl(F_SETFL,
     //    O_NONBLOCK)` has no such failure mode.
     stream.set_nonblocking(true)?;
-    exchange(&mut stream, req, REPLY_STALL, REPLY_DEADLINE)
+    exchange(&mut stream, req, stall, hard)
 }
 
 /// One request/reply exchange on an already non-blocking stream.

@@ -19,18 +19,33 @@
 //     says nothing occupies one slot with its own deadline, not the endpoint.
 // ---------------------------------------------------------------------------
 use super::chan::{Channel, Conn, ReadOutcome, Recv, Sent, WriteOutcome};
+use super::hold::{Held, Ticket};
 use super::winmap::{self, Accepted};
 use super::wire::{
-    expired, reply_too_large, CLIENT_POLL, DRAIN_DEADLINE, MAX_REPLY, MAX_SLOTS, OVERSIZE_REPLY,
+    expired, reply_too_large, ACCEPT_PER_TICK, ACCEPT_RETRY, CLIENT_POLL, DRAIN_DEADLINE,
+    HOLD_EXPIRED_REPLY, HOLD_FULL_REPLY, MAX_OUTBOX, MAX_REPLY, MAX_SLOTS, OVERSIZE_REPLY,
     REPLY_DEADLINE, REPLY_STALL, TOO_LARGE_REPLY,
 };
 use std::ffi::c_void;
 use std::io;
 use std::os::windows::ffi::OsStrExt;
-use std::thread;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::Arc;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 type Handle = *mut c_void;
+
+/// The waker a [`Listener::bind_waking`] accept thread rings on each connect.
+pub type Wake = Box<dyn Fn() + Send + Sync + 'static>;
+
+/// A pipe handle crossing to the run loop. Kernel handles are usable from any
+/// thread; the newtype exists only because a raw pointer is not `Send`.
+struct SendHandle(Handle);
+// SAFETY: a named-pipe handle is a kernel object reference with no thread
+// affinity; the accept thread gives up all use of it once it is sent.
+unsafe impl Send for SendHandle {}
 
 #[link(name = "kernel32")]
 extern "system" {
@@ -276,6 +291,10 @@ const INVALID_HANDLE_VALUE: Handle = usize::MAX as Handle;
 /// silent client could hold the entire control plane; this is the Windows
 /// half of the bounded slot pool.
 const INSTANCES: usize = MAX_SLOTS;
+/// With an accept thread the pool is not fixed: every connect adds an instance
+/// and a finished one is closed. This bounds it — half-open readers plus
+/// draining writers, the two pools the unix side keeps apart.
+const POOL_MAX: usize = MAX_SLOTS + MAX_OUTBOX;
 
 fn wide(s: &str) -> Vec<u16> {
     std::ffi::OsStr::new(s).encode_wide().chain([0]).collect()
@@ -370,6 +389,10 @@ enum Phase {
     /// Every byte is in the pipe; waiting for the client to close so the
     /// disconnect cannot discard it.
     Draining,
+    /// Closed (accept-thread mode only, where instances are not reused): the
+    /// handle is gone and the entry leaves the pool on the next `poll`, so
+    /// the index loops that run between are not disturbed.
+    Spent,
 }
 
 struct Instance {
@@ -378,10 +401,167 @@ struct Instance {
     chan: Channel<PipeConn>,
 }
 
+/// The accept thread: one *blocking* pipe instance that it waits on with
+/// `ConnectNamedPipe`, handed to the run loop (switched to `PIPE_NOWAIT`
+/// first, so the pool's read/write code is unchanged) the moment a client
+/// connects, replaced by a fresh instance, repeat. The pool's instances are
+/// never listening in this mode — a finished one is closed, not re-armed — so
+/// every connect lands on the thread's instance and rings the waker.
+struct Acceptor {
+    rx: Receiver<SendHandle>,
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+    addr: Vec<u16>,
+}
+
+impl Acceptor {
+    fn start(addr: Vec<u16>, first: Handle, wake: Wake) -> io::Result<Acceptor> {
+        let (tx, rx) = mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        let name = addr.clone();
+        let first = SendHandle(first);
+        let thread = thread::Builder::new()
+            .name("ipc-accept".to_string())
+            .spawn(move || accept_loop(first, name, tx, wake, flag));
+        match thread {
+            Ok(thread) => Ok(Acceptor {
+                rx,
+                stop,
+                thread: Some(thread),
+                addr,
+            }),
+            Err(e) => {
+                // The closure was never run, so `first` is still ours: it is
+                // closed in `bind_waking`'s error path, which still holds the
+                // raw handle.
+                Err(e)
+            }
+        }
+    }
+
+    /// Ask the thread to leave and wait for it. Its one wait is
+    /// `ConnectNamedPipe`, which a connect to our own name completes; the
+    /// thread then sees the flag and closes its instance. The connect is
+    /// repeated until the thread is seen finished, because the thread may be
+    /// between instances when the first one is tried.
+    fn stop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        let Some(thread) = self.thread.take() else {
+            return;
+        };
+        while !thread.is_finished() {
+            // SAFETY: `addr` is a NUL-terminated wide string alive for the
+            // call; null security attributes and template are permitted.
+            let h = unsafe {
+                CreateFileW(
+                    self.addr.as_ptr(),
+                    GENERIC_READ | GENERIC_WRITE,
+                    0,
+                    std::ptr::null_mut(),
+                    OPEN_EXISTING,
+                    0,
+                    std::ptr::null_mut(),
+                )
+            };
+            if h != INVALID_HANDLE_VALUE {
+                // SAFETY: `h` is the valid handle just returned; closed once.
+                unsafe { CloseHandle(h) };
+            }
+            thread::yield_now();
+        }
+        let _ = thread.join();
+    }
+}
+
+/// The accept thread's body. `h` is always the one listening instance.
+fn accept_loop(
+    first: SendHandle,
+    addr: Vec<u16>,
+    tx: Sender<SendHandle>,
+    wake: Wake,
+    stop: Arc<AtomicBool>,
+) {
+    let mut h = first.0;
+    let close = |h: Handle| {
+        // SAFETY: `h` is an open instance this thread owns and uses no more.
+        unsafe {
+            DisconnectNamedPipe(h);
+            CloseHandle(h);
+        }
+    };
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            return close(h);
+        }
+        // SAFETY: `h` is an open blocking pipe instance this thread owns; a
+        // null OVERLAPPED is valid, the instance was created without
+        // FILE_FLAG_OVERLAPPED, so the call waits for a client.
+        let r = unsafe { ConnectNamedPipe(h, std::ptr::null_mut()) };
+        let err = if r == 0 { last() } else { 0 };
+        if stop.load(Ordering::SeqCst) {
+            return close(h);
+        }
+        match winmap::connect_outcome(r, err) {
+            Accepted::Connected => {
+                let mut mode = PIPE_READMODE_BYTE | PIPE_NOWAIT;
+                // SAFETY: `h` is open; `mode` is a live local, and the null
+                // pointers leave the other settings unchanged.
+                unsafe {
+                    SetNamedPipeHandleState(
+                        h,
+                        &mut mode,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                    );
+                }
+                // The next listening instance BEFORE the hand-over, so the
+                // name is never without one (a client would see
+                // ERROR_FILE_NOT_FOUND, and another process could claim it).
+                let next = loop {
+                    match Listener::create_instance(&addr, false, false) {
+                        Ok(n) => break n,
+                        Err(_) => {
+                            if stop.load(Ordering::SeqCst) {
+                                return close(h);
+                            }
+                            thread::sleep(ACCEPT_RETRY);
+                        }
+                    }
+                };
+                if tx.send(SendHandle(h)).is_err() {
+                    close(next);
+                    return close(h); // the Listener is gone
+                }
+                wake();
+                h = next;
+            }
+            // The client came and went: listen again on the same instance.
+            Accepted::Recycle => {
+                // SAFETY: `h` is an open instance this thread owns.
+                unsafe { DisconnectNamedPipe(h) };
+            }
+            // A blocking ConnectNamedPipe does not report "listening"; this
+            // is a real error (the handle cancelled, a resource failure).
+            // Nap and retry so a persistent one is a slow loop, not a hot one.
+            Accepted::Listening => {
+                // SAFETY: `h` is an open instance this thread owns.
+                unsafe { DisconnectNamedPipe(h) };
+                thread::sleep(ACCEPT_RETRY);
+            }
+        }
+    }
+}
+
 pub struct Listener {
     instances: Vec<Instance>,
     /// Index of the instance whose request the caller still owes a reply.
     serving: Option<usize>,
+    /// Requests the caller took off the latch to answer later (`park`).
+    held: Held<Instance>,
+    /// The accept thread, when bound with `bind_waking`; `None` means the pool
+    /// of `INSTANCES` fixed instances with `ConnectNamedPipe` retried per poll.
+    accept: Option<Acceptor>,
 }
 
 // SAFETY: the raw pointers are kernel pipe handles, which are usable from any
@@ -390,7 +570,7 @@ pub struct Listener {
 unsafe impl Send for Listener {}
 
 impl Listener {
-    fn create_instance(addr: &[u16], first: bool) -> io::Result<Handle> {
+    fn create_instance(addr: &[u16], first: bool, nowait: bool) -> io::Result<Handle> {
         // Restrict the endpoint to the current user (+SYSTEM): another user's
         // process cannot open the control pipe even on a shared machine. This
         // is the Windows analog of the unix peer-uid check. If the descriptor
@@ -424,6 +604,12 @@ impl Listener {
         if first {
             open_mode |= FILE_FLAG_FIRST_PIPE_INSTANCE;
         }
+        // The accept thread's instance waits in `ConnectNamedPipe`, so it is
+        // created blocking and switched to NOWAIT once a client is on it.
+        let mut pipe_mode = PIPE_TYPE_BYTE | PIPE_READMODE_BYTE;
+        if nowait {
+            pipe_mode |= PIPE_NOWAIT;
+        }
         // SAFETY: `addr` is the NUL-terminated wide name `bind` built with `wide`,
         // alive for the call; `sec_ptr` is null or points at `sa`, a live local
         // whose `sd` is the descriptor built above (still unfreed).
@@ -431,7 +617,7 @@ impl Listener {
             CreateNamedPipeW(
                 addr.as_ptr(),
                 open_mode,
-                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_NOWAIT,
+                pipe_mode,
                 PIPE_UNLIMITED_INSTANCES,
                 PIPE_BUF,
                 PIPE_BUF,
@@ -459,7 +645,7 @@ impl Listener {
         // are capacity, so a failure there costs throughput, not the bind.
         let mut instances = Vec::with_capacity(INSTANCES);
         for i in 0..INSTANCES {
-            match Self::create_instance(&addr, i == 0) {
+            match Self::create_instance(&addr, i == 0, true) {
                 Ok(handle) => instances.push(Instance {
                     handle,
                     phase: Phase::Idle,
@@ -472,18 +658,181 @@ impl Listener {
         Ok(Listener {
             instances,
             serving: None,
+            held: Held::new(),
+            accept: None,
         })
     }
 
-    /// Drop the current client and re-arm this instance to listen again.
+    /// Bind with an accept thread that rings `wake` on every connect. The first
+    /// instance claims the name exactly as `bind` does (same SDDL, same
+    /// `FILE_FLAG_FIRST_PIPE_INSTANCE`); it is the thread's, blocking, and the
+    /// pool starts empty and holds only connected clients.
+    pub fn bind_waking(addr: &str, wake: Wake) -> io::Result<Listener> {
+        let addr = wide(addr);
+        let first = Self::create_instance(&addr, true, false)?;
+        let accept = match Acceptor::start(addr, first, wake) {
+            Ok(a) => a,
+            Err(e) => {
+                // SAFETY: `first` is the open instance just created; the thread
+                // that would have owned it never started; closed exactly once.
+                unsafe { CloseHandle(first) };
+                return Err(e);
+            }
+        };
+        Ok(Listener {
+            instances: Vec::new(),
+            serving: None,
+            held: Held::new(),
+            accept: Some(accept),
+        })
+    }
+
+    /// Drop the current client. With a fixed pool the instance is re-armed to
+    /// listen again; with an accept thread it is closed — a listening instance
+    /// in the pool would take clients without a wake — and leaves the pool on
+    /// the next `poll`.
     fn recycle(&mut self, i: usize, now: Instant) {
         // SAFETY: the handle is an open pipe instance this Listener owns and
-        // closes only in Drop; with no client attached the call just fails.
+        // closes only in Drop (or just below); with no client attached the
+        // call just fails.
         unsafe {
             DisconnectNamedPipe(self.instances[i].handle);
         }
+        if self.accept.is_some() {
+            // SAFETY: the handle is open (this phase is set only here, and the
+            // entry is removed before any other use); closed exactly once.
+            unsafe { CloseHandle(self.instances[i].handle) };
+            self.instances[i].phase = Phase::Spent;
+            return;
+        }
         self.instances[i].phase = Phase::Idle;
         self.instances[i].chan.reset(now);
+    }
+
+    /// Take the clients the accept thread connected since the last poll into
+    /// the pool, a few per tick, evicting when it is full: a reader past its
+    /// deadline, a writer that stalled, a drainer past its deadline, else the
+    /// oldest half-open reader. A newcomer that would need a healthy writer
+    /// evicted is closed instead — a reply in flight outranks a request not
+    /// yet read.
+    fn admit_connected(&mut self, now: Instant) {
+        for _ in 0..ACCEPT_PER_TICK {
+            let handle = match self.accept.as_ref().map(|a| a.rx.try_recv()) {
+                Some(Ok(SendHandle(h))) => h,
+                Some(Err(TryRecvError::Empty)) | Some(Err(TryRecvError::Disconnected)) | None => {
+                    return
+                }
+            };
+            if self.instances.len() >= POOL_MAX {
+                let victim = self
+                    .instances
+                    .iter()
+                    .position(|i| i.phase == Phase::Reading && i.chan.read_expired(now))
+                    .or_else(|| {
+                        self.instances
+                            .iter()
+                            .position(|i| i.phase == Phase::Writing && i.chan.write_stalled(now))
+                    })
+                    .or_else(|| {
+                        self.instances.iter().position(|i| {
+                            i.phase == Phase::Draining
+                                && expired(i.chan.since(), now, DRAIN_DEADLINE)
+                        })
+                    })
+                    .or_else(|| {
+                        self.instances
+                            .iter()
+                            .position(|i| i.phase == Phase::Reading)
+                    });
+                match victim {
+                    Some(i) => {
+                        self.recycle(i, now);
+                        self.instances.retain(|i| i.phase != Phase::Spent);
+                    }
+                    None => {
+                        // SAFETY: `handle` is the open instance the thread
+                        // handed over; nothing else holds it; closed once.
+                        unsafe {
+                            DisconnectNamedPipe(handle);
+                            CloseHandle(handle);
+                        }
+                        continue;
+                    }
+                }
+            }
+            self.instances.push(Instance {
+                handle,
+                phase: Phase::Reading,
+                chan: Channel::new(PipeConn { handle }, now),
+            });
+        }
+    }
+
+    /// How many requests are held for a later answer. Tests and diagnostics.
+    pub fn held_len(&self) -> usize {
+        self.held.len()
+    }
+
+    /// Take the request the last `poll` returned off the latch, to answer it
+    /// later with [`respond_parked`](Listener::respond_parked). `None` when
+    /// nothing is outstanding, or when the hold pool is full — in which case
+    /// the client has already been refused with [`HOLD_FULL_REPLY`] and will
+    /// ask again.
+    pub fn park(&mut self) -> Option<Ticket> {
+        let now = Instant::now();
+        let i = self.serving.take()?;
+        if self.held.is_full() {
+            self.instances[i].chan.queue(HOLD_FULL_REPLY, now);
+            self.instances[i].phase = Phase::Writing;
+            let _ = self.instances[i].chan.pump_write(now);
+            return None;
+        }
+        // The instance leaves the pool for the duration of the hold; the
+        // index loops are not running (this is called between polls), so the
+        // removal is safe, and `serving` was just cleared.
+        let inst = self.instances.remove(i);
+        Some(self.held.park(inst, now))
+    }
+
+    /// Answer a held request through the same never-blocking path as
+    /// `respond`. `NotFound` for a ticket that is no longer held: answered,
+    /// timed out, or its client left.
+    pub fn respond_parked(&mut self, ticket: Ticket, reply: &str) -> io::Result<()> {
+        let Some(inst) = self.held.take(ticket) else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "no such held request: it was answered, timed out, or its client left",
+            ));
+        };
+        // Back into the pool, then through `respond` as the serving instance,
+        // without disturbing a request the caller may still owe an answer.
+        self.instances.push(inst);
+        let outstanding = self.serving.replace(self.instances.len() - 1);
+        let r = self.respond(reply);
+        self.serving = outstanding;
+        r
+    }
+
+    /// Tickets whose hold is over since the last call; see `Held::take_expired`.
+    pub fn take_expired(&mut self) -> Vec<Ticket> {
+        self.held.take_expired()
+    }
+
+    /// Age the held requests: drop those whose client left, report the ones
+    /// past the deadline, and refuse the ones reported last time that are still
+    /// unanswered (the refusal drains through the pool like any reply).
+    fn service_held(&mut self, now: Instant) {
+        if self.held.is_empty() {
+            return;
+        }
+        // `peer_gone` is the NOWAIT read whose ERROR_BROKEN_PIPE says the
+        // client closed its handle; a held client sends nothing more.
+        self.held.prune(|inst| inst.chan.peer_gone());
+        for mut inst in self.held.sweep(now) {
+            inst.chan.queue(HOLD_EXPIRED_REPLY, now);
+            inst.phase = Phase::Writing;
+            self.instances.push(inst);
+        }
     }
 
     /// Move every instance that owes bytes (or is waiting to be released) one
@@ -540,14 +889,21 @@ impl Listener {
         if let Some(i) = self.serving.take() {
             self.recycle(i, now);
         }
+        // Holds that ran out join the pool as refusals, then every writer
+        // moves a step; then the instances closed since the last poll leave.
+        self.service_held(now);
         self.service_writes(now);
+        self.instances.retain(|i| i.phase != Phase::Spent);
         debug_assert!(self.serving.is_none(), "released above");
 
         // One request outstanding at a time: the instance that carries it
         // leaves `Phase::Reading`, so the loop below cannot hand out a
         // second. The other instances keep their clients and deadlines.
 
-        // Attach any waiting client to a free instance.
+        // Attach any waiting client to a free instance: the ones the accept
+        // thread connected, or — with the fixed pool — whoever is on an idle
+        // instance (no instance is ever idle in accept-thread mode).
+        self.admit_connected(now);
         for i in 0..self.instances.len() {
             if self.instances[i].phase != Phase::Idle {
                 continue;
@@ -656,9 +1012,19 @@ impl Listener {
 
 impl Drop for Listener {
     fn drop(&mut self) {
-        for inst in &self.instances {
-            // SAFETY: each handle came from CreateNamedPipeW in `bind`, is still
-            // open, and is closed exactly once, here, as the Listener drops.
+        // The accept thread first: its wake-up is a connect to our own name,
+        // which must still have a listening instance (the thread's).
+        if let Some(mut a) = self.accept.take() {
+            a.stop();
+        }
+        let held = self.held.drain();
+        for inst in self.instances.iter().chain(held.iter()) {
+            if inst.phase == Phase::Spent {
+                continue; // closed in `recycle`
+            }
+            // SAFETY: each handle came from CreateNamedPipeW (in `bind` or on
+            // the accept thread), is still open, and is closed exactly once,
+            // here, as the Listener drops.
             unsafe {
                 DisconnectNamedPipe(inst.handle);
                 CloseHandle(inst.handle);
@@ -668,11 +1034,21 @@ impl Drop for Listener {
 }
 
 pub fn request(addr: &str, req: &str) -> io::Result<String> {
+    request_with(addr, req, REPLY_STALL, REPLY_DEADLINE)
+}
+
+/// A request the server may hold for up to `hold` before answering: the
+/// stall and total budgets are each extended by it, nothing else differs.
+pub fn request_held(addr: &str, req: &str, hold: Duration) -> io::Result<String> {
+    request_with(addr, req, hold + REPLY_STALL, hold + REPLY_DEADLINE)
+}
+
+fn request_with(addr: &str, req: &str, stall: Duration, hard: Duration) -> io::Result<String> {
     let name = wide(addr);
     // One budget for the whole exchange, from `wire`, the same constant the
     // unix client uses — not a literal that happens to be five.
     let start = Instant::now();
-    let deadline = start + REPLY_DEADLINE;
+    let deadline = start + hard;
     let mut h = INVALID_HANDLE_VALUE;
     while Instant::now() < deadline {
         // SAFETY: `name` is a NUL-terminated wide string (from `wide`) alive for
@@ -762,7 +1138,7 @@ pub fn request(addr: &str, req: &str) -> io::Result<String> {
         off += written as usize;
     }
 
-    let out = read_reply(h, start, REPLY_STALL, REPLY_DEADLINE);
+    let out = read_reply(h, start, stall, hard);
     // SAFETY: `h` is open; `read_reply` has returned and nothing uses the
     // handle after this single close.
     unsafe { CloseHandle(h) };
