@@ -1,0 +1,17 @@
+[package]
+name = "nativelite-ipc"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+description = "A local, same-user, one-line-request/one-line-reply control channel: a Windows named pipe or a unix socket, served non-blocking from a run loop, with the hardening a hostile client made necessary. Standard library only."
+license = "MIT"
+repository = "https://github.com/nativelite/ipc"
+keywords = ["ipc", "named-pipe", "unix-socket", "control-plane", "nativelite"]
+categories = ["os", "network-programming"]
+
+# nativelite core rule: ZERO third-party dependencies. Do not add to this.
+[dependencies]
+
+[lib]
+name = "nativelite_ipc"
+path = "src/lib.rs"
