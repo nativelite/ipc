@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.2.0] - 2026-11-08
 
+### Fixed (review of the accept thread, before release)
+- **The hand-over from the accept thread to `poll` is bounded** at
+  `HANDOVER_CAP` (`MAX_SLOTS + MAX_OUTBOX`); it was an unbounded channel, so a
+  connect flood against a stalled loop held one fd or pipe instance per
+  client until EMFILE. A client past the cap is turned away at the door
+  (unix: `{"ok":false,"err":"server busy; ask again"}` then close; Windows: a
+  close, since the disconnect would discard a reply) and counted;
+  `Listener::refused_at_door` reads the count and the bounded-rate refusal
+  report names it.
+- **Windows: connections still queued when the listener drops are closed**
+  (`SendHandle` owns its handle and disconnects+closes on drop; `Drop` drains
+  the hand-over), so their clients see EOF instead of hanging on a pipe nobody
+  reads. The same drain on unix.
+- **`Drop` waits for the accept thread on a real clock** (200 ms unix, 2 s
+  Windows, 1 ms naps) instead of a spin count or an unbounded busy loop, and
+  detaches with a warning past the deadline. The thread checks the stop flag
+  right before ringing, so at most one ring can land after the drop; a waker
+  must be harmless then (atrium's ring into an empty slot is).
+- **A panic in the waker no longer kills acceptance**: it is caught; and a
+  thread that has nevertheless exited makes `poll` return an error (the host
+  notices) instead of reporting an idle channel forever.
+- Documented: the wake fires on connect, before the request bytes land, so the
+  first poll after a wake may see nothing and the fallback tick serves it; on
+  Windows the pool plus the held instances is bounded at `POOL_MAX + MAX_HELD`.
+
 ### Added
 - **`Listener::bind_waking(addr, wake)`: the run loop is woken on connect.**
   An accept thread blocks on the endpoint (a blocking `accept` on unix; on

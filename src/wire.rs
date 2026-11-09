@@ -128,6 +128,26 @@ pub const HOLD_FULL_REPLY: &str = r#"{"ok":false,"err":"too many held requests; 
 /// not be created, an `accept` that returned an error), so a persistent
 /// failure costs a nap per attempt rather than a spinning core.
 pub const ACCEPT_RETRY: Duration = Duration::from_millis(50);
+/// How many accepted connections the accept thread may have handed to the run
+/// loop that the loop has not yet taken (`ACCEPT_PER_TICK` per poll). The
+/// kernel backlog used to bound this; a thread that accepts at full speed
+/// needs its own bound, or a connect flood against a stalled loop holds one fd
+/// (or pipe instance) per client until EMFILE hits the whole process. The
+/// same size as the pool the loop admits into; past it the thread turns the
+/// newest client away at the door ([`BUSY_REPLY`] where a close delivers it,
+/// else just the close) and counts it with the other refusals.
+pub const HANDOVER_CAP: usize = MAX_SLOTS + MAX_OUTBOX;
+/// What a client hears when it is turned away at the door.
+pub const BUSY_REPLY: &str = r#"{"ok":false,"err":"server busy; ask again"}"#;
+/// How long `Drop` waits for the accept thread to leave on unix, where the
+/// wake-up (`shutdown` and a self-connect) is prompt; past this the thread is
+/// detached and dies with the process.
+pub const STOP_JOIN_UNIX: Duration = Duration::from_millis(200);
+/// The same on Windows, where the wake-up is a connect to our own name that
+/// may have to be repeated while the thread is between instances.
+pub const STOP_JOIN_WINDOWS: Duration = Duration::from_secs(2);
+/// How often `Drop` re-checks for the thread while waiting.
+pub const STOP_POLL: Duration = Duration::from_millis(1);
 
 /// The error `respond` hands back for a reply over [`MAX_REPLY`]. One
 /// function rather than one copy per platform: this file already shipped a

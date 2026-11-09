@@ -22,7 +22,16 @@
 //!   caller-supplied waker the moment a client connects, so a run loop that
 //!   sleeps on a doorbell is woken for a request instead of finding it on its
 //!   next tick, and nothing is retried per tick to notice a connect. `poll`
-//!   keeps its contract and the loop keeps polling as its fallback.
+//!   keeps its contract and the loop keeps polling as its fallback — and
+//!   needs to: the wake fires on the *connect*, usually before the request
+//!   bytes land, so the first poll after a wake may see nothing and the
+//!   fallback tick serves the request. The hand-over from the thread is
+//!   bounded (`HANDOVER_CAP`); a client past it is turned away at the door
+//!   and counted with the refusals. On Windows the pool of connected
+//!   instances plus the held ones is bounded at `POOL_MAX + MAX_HELD`. A waker
+//!   that panics is caught; a thread that has nevertheless exited makes `poll`
+//!   return an error rather than idle. One late ring after the listener is
+//!   dropped is possible and must be harmless to the waker.
 //! * [`Listener::park`] / [`Listener::respond_parked`] — answer later. A
 //!   request the server cannot answer yet (an `inbox --wait` with nothing
 //!   queued) is taken off the one-at-a-time latch under a [`Ticket`] and
@@ -119,9 +128,15 @@ impl Listener {
     /// [`poll`](Listener::poll) to read, rings, and blocks again. The waker
     /// runs on that thread, so it must be cheap and must not take a lock the
     /// run loop holds while polling — a doorbell `try_send` is the intended
-    /// shape. Nothing else changes: the peer check, the slot pool and its
-    /// deadlines run on the polling thread as before. Dropping the listener
-    /// stops the thread without waiting on a client.
+    /// shape, and it is called under `catch_unwind`, so a panic in it costs
+    /// one ring, not the endpoint. Nothing else changes: the peer check, the
+    /// slot pool and its deadlines run on the polling thread as before. The
+    /// hand-over holds at most [`HANDOVER_CAP`] connections the loop has not
+    /// taken; past that the thread turns the newest client away at the door
+    /// (unix: with the busy refusal; Windows: a close) and counts it with the
+    /// refusals. Dropping the listener stops the thread without waiting on a
+    /// client, closes whatever was still in the hand-over (those clients see
+    /// EOF), and may let at most one ring land after the drop.
     pub fn bind_waking(
         addr: &str,
         wake: Box<dyn Fn() + Send + Sync + 'static>,
@@ -212,6 +227,13 @@ impl Listener {
         self.sys.held_len()
     }
 
+    /// How many clients a `bind_waking` accept thread has turned away at the
+    /// door since bind, because the hand-over to `poll` was full
+    /// ([`HANDOVER_CAP`]). Always `0` for a plain `bind`. Diagnostics.
+    pub fn refused_at_door(&self) -> usize {
+        self.sys.refused_at_door()
+    }
+
     /// Take the last endpoint-integrity alarm, if one fired.
     ///
     /// On unix the ctl socket path lives in a directory the user owns, so a
@@ -268,6 +290,9 @@ pub use hold::Ticket;
 pub const HOLD_DEADLINE: std::time::Duration = wire::HOLD_DEADLINE;
 /// How many requests a server holds at once before `park` refuses the newest.
 pub const MAX_HELD: usize = wire::MAX_HELD;
+/// How many accepted connections a `bind_waking` thread may have handed over
+/// that `poll` has not yet taken; past it clients are turned away at the door.
+pub const HANDOVER_CAP: usize = wire::HANDOVER_CAP;
 
 #[allow(dead_code)]
 mod chan;
@@ -291,6 +316,8 @@ use sys_unix as sys;
 mod guards;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_accept;
 #[cfg(all(test, unix))]
 mod tests_unix;
 #[cfg(test)]

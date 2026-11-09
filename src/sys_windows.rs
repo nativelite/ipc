@@ -23,14 +23,15 @@ use super::hold::{Held, Ticket};
 use super::winmap::{self, Accepted};
 use super::wire::{
     expired, reply_too_large, ACCEPT_PER_TICK, ACCEPT_RETRY, CLIENT_POLL, DRAIN_DEADLINE,
-    HOLD_EXPIRED_REPLY, HOLD_FULL_REPLY, MAX_OUTBOX, MAX_REPLY, MAX_SLOTS, OVERSIZE_REPLY,
-    REPLY_DEADLINE, REPLY_STALL, TOO_LARGE_REPLY,
+    HANDOVER_CAP, HOLD_EXPIRED_REPLY, HOLD_FULL_REPLY, MAX_OUTBOX, MAX_REPLY, MAX_SLOTS,
+    OVERSIZE_REPLY, REFUSAL_REPORT_EVERY, REPLY_DEADLINE, REPLY_STALL, STOP_JOIN_WINDOWS,
+    STOP_POLL, TOO_LARGE_REPLY,
 };
 use std::ffi::c_void;
 use std::io;
 use std::os::windows::ffi::OsStrExt;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -40,12 +41,45 @@ type Handle = *mut c_void;
 /// The waker a [`Listener::bind_waking`] accept thread rings on each connect.
 pub type Wake = Box<dyn Fn() + Send + Sync + 'static>;
 
-/// A pipe handle crossing to the run loop. Kernel handles are usable from any
-/// thread; the newtype exists only because a raw pointer is not `Send`.
+/// A connected pipe instance crossing from the accept thread to the run loop.
+/// Owns the handle while in flight: one that is never taken (the listener
+/// dropped with connections still queued, a hand-over refused) is
+/// disconnected and closed when it drops, so its client sees EOF instead of a
+/// pipe nobody will ever read. The newtype also carries the `Send` a raw
+/// pointer lacks.
 struct SendHandle(Handle);
 // SAFETY: a named-pipe handle is a kernel object reference with no thread
 // affinity; the accept thread gives up all use of it once it is sent.
 unsafe impl Send for SendHandle {}
+
+impl SendHandle {
+    /// Take the handle over; the pool closes it from here on.
+    fn into_inner(self) -> Handle {
+        let h = self.0;
+        std::mem::forget(self);
+        h
+    }
+}
+
+impl Drop for SendHandle {
+    fn drop(&mut self) {
+        // SAFETY: the handle is an open instance nobody else holds (the pool
+        // takes it with `into_inner`, which skips this); closed exactly once.
+        unsafe {
+            DisconnectNamedPipe(self.0);
+            CloseHandle(self.0);
+        }
+    }
+}
+
+/// What `poll` returns once the accept thread has exited: the endpoint takes
+/// no more clients, and a host that keeps polling would otherwise never know.
+fn accept_thread_gone() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Other,
+        "the ctl accept thread has exited; the endpoint accepts no more clients",
+    )
+}
 
 #[link(name = "kernel32")]
 extern "system" {
@@ -407,70 +441,87 @@ struct Instance {
 /// connects, replaced by a fresh instance, repeat. The pool's instances are
 /// never listening in this mode — a finished one is closed, not re-armed — so
 /// every connect lands on the thread's instance and rings the waker.
+///
+/// The hand-over is bounded at [`HANDOVER_CAP`] instances the run loop has not
+/// taken yet; a client past it is disconnected at the door (a refusal written
+/// first would be discarded by the disconnect, so none is), counted in `busy`
+/// and reported at the same bounded rate as the unix credential refusals.
 struct Acceptor {
     rx: Receiver<SendHandle>,
     stop: Arc<AtomicBool>,
+    /// Clients turned away at the door since bind.
+    busy: Arc<AtomicUsize>,
     thread: Option<JoinHandle<()>>,
     addr: Vec<u16>,
 }
 
 impl Acceptor {
     fn start(addr: Vec<u16>, first: Handle, wake: Wake) -> io::Result<Acceptor> {
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(HANDOVER_CAP);
         let stop = Arc::new(AtomicBool::new(false));
-        let flag = Arc::clone(&stop);
+        let busy = Arc::new(AtomicUsize::new(0));
+        let (flag, counter) = (Arc::clone(&stop), Arc::clone(&busy));
         let name = addr.clone();
         let first = SendHandle(first);
         let thread = thread::Builder::new()
             .name("ipc-accept".to_string())
-            .spawn(move || accept_loop(first, name, tx, wake, flag));
+            .spawn(move || accept_loop(first, name, tx, wake, flag, counter));
         match thread {
             Ok(thread) => Ok(Acceptor {
                 rx,
                 stop,
+                busy,
                 thread: Some(thread),
                 addr,
             }),
             Err(e) => {
-                // The closure was never run, so `first` is still ours: it is
-                // closed in `bind_waking`'s error path, which still holds the
-                // raw handle.
+                // The closure was never run and dropped with it, so `first`
+                // (owned by the closure's `SendHandle`) is already closed; the
+                // caller must not close the raw handle again.
                 Err(e)
             }
         }
     }
 
-    /// Ask the thread to leave and wait for it. Its one wait is
-    /// `ConnectNamedPipe`, which a connect to our own name completes; the
-    /// thread then sees the flag and closes its instance. The connect is
-    /// repeated until the thread is seen finished, because the thread may be
-    /// between instances when the first one is tried.
+    /// Ask the thread to leave and wait for it, for at most
+    /// [`STOP_JOIN_WINDOWS`]. Its one wait is `ConnectNamedPipe`, which a
+    /// connect to our own name completes; the thread then sees the flag and
+    /// closes its instance. The connect is repeated, a nap apart, because the
+    /// thread may be between instances when one is tried. Past the deadline the
+    /// thread is detached with a warning rather than hanging the drop. The
+    /// instances still in the hand-over are dropped here (`SendHandle::drop`
+    /// disconnects and closes), so their clients see EOF.
     fn stop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        let Some(thread) = self.thread.take() else {
-            return;
-        };
-        while !thread.is_finished() {
-            // SAFETY: `addr` is a NUL-terminated wide string alive for the
-            // call; null security attributes and template are permitted.
-            let h = unsafe {
-                CreateFileW(
-                    self.addr.as_ptr(),
-                    GENERIC_READ | GENERIC_WRITE,
-                    0,
-                    std::ptr::null_mut(),
-                    OPEN_EXISTING,
-                    0,
-                    std::ptr::null_mut(),
-                )
-            };
-            if h != INVALID_HANDLE_VALUE {
-                // SAFETY: `h` is the valid handle just returned; closed once.
-                unsafe { CloseHandle(h) };
+        if let Some(thread) = self.thread.take() {
+            let deadline = Instant::now() + STOP_JOIN_WINDOWS;
+            while !thread.is_finished() && Instant::now() < deadline {
+                // SAFETY: `addr` is a NUL-terminated wide string alive for the
+                // call; null security attributes and template are permitted.
+                let h = unsafe {
+                    CreateFileW(
+                        self.addr.as_ptr(),
+                        GENERIC_READ | GENERIC_WRITE,
+                        0,
+                        std::ptr::null_mut(),
+                        OPEN_EXISTING,
+                        0,
+                        std::ptr::null_mut(),
+                    )
+                };
+                if h != INVALID_HANDLE_VALUE {
+                    // SAFETY: `h` is the valid handle just returned; closed once.
+                    unsafe { CloseHandle(h) };
+                }
+                thread::sleep(STOP_POLL);
             }
-            thread::yield_now();
+            if thread.is_finished() {
+                let _ = thread.join();
+            } else {
+                eprint!("[ipc] the accept thread did not stop in time; detached\r\n");
+            }
         }
-        let _ = thread.join();
+        while self.rx.try_recv().is_ok() {}
     }
 }
 
@@ -478,11 +529,12 @@ impl Acceptor {
 fn accept_loop(
     first: SendHandle,
     addr: Vec<u16>,
-    tx: Sender<SendHandle>,
+    tx: SyncSender<SendHandle>,
     wake: Wake,
     stop: Arc<AtomicBool>,
+    busy: Arc<AtomicUsize>,
 ) {
-    let mut h = first.0;
+    let mut h = first.into_inner();
     let close = |h: Handle| {
         // SAFETY: `h` is an open instance this thread owns and uses no more.
         unsafe {
@@ -529,12 +581,29 @@ fn accept_loop(
                         }
                     }
                 };
-                if tx.send(SendHandle(h)).is_err() {
-                    close(next);
-                    return close(h); // the Listener is gone
+                match tx.try_send(SendHandle(h)) {
+                    Ok(()) => {}
+                    // The loop has not taken what it was handed: this client
+                    // is turned away at the door (dropping the `SendHandle`
+                    // disconnects and closes it) and counted.
+                    Err(TrySendError::Full(refused)) => {
+                        busy.fetch_add(1, Ordering::Relaxed);
+                        drop(refused);
+                        h = next;
+                        continue;
+                    }
+                    Err(TrySendError::Disconnected(gone)) => {
+                        drop(gone);
+                        return close(next); // the Listener is gone
+                    }
                 }
-                wake();
                 h = next;
+                if stop.load(Ordering::SeqCst) {
+                    return close(h);
+                }
+                // A waker that panics must not take acceptance down with it:
+                // the thread is the only path clients have in.
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(&wake));
             }
             // The client came and went: listen again on the same instance.
             Accepted::Recycle => {
@@ -562,6 +631,10 @@ pub struct Listener {
     /// The accept thread, when bound with `bind_waking`; `None` means the pool
     /// of `INSTANCES` fixed instances with `ConnectNamedPipe` retried per poll.
     accept: Option<Acceptor>,
+    /// How many door refusals (`Acceptor::busy`) the last report covered, and
+    /// when that report went out: the same bounded-rate report as unix.
+    busy_reported: usize,
+    refusal_reported: Option<Instant>,
 }
 
 // SAFETY: the raw pointers are kernel pipe handles, which are usable from any
@@ -660,6 +733,8 @@ impl Listener {
             serving: None,
             held: Held::new(),
             accept: None,
+            busy_reported: 0,
+            refusal_reported: None,
         })
     }
 
@@ -670,19 +745,15 @@ impl Listener {
     pub fn bind_waking(addr: &str, wake: Wake) -> io::Result<Listener> {
         let addr = wide(addr);
         let first = Self::create_instance(&addr, true, false)?;
-        let accept = match Acceptor::start(addr, first, wake) {
-            Ok(a) => a,
-            Err(e) => {
-                // SAFETY: `first` is the open instance just created; the thread
-                // that would have owned it never started; closed exactly once.
-                unsafe { CloseHandle(first) };
-                return Err(e);
-            }
-        };
+        // On failure the thread closure, and the `SendHandle` owning `first`
+        // inside it, were dropped by `spawn`: the instance is already closed.
+        let accept = Acceptor::start(addr, first, wake)?;
         Ok(Listener {
             instances: Vec::new(),
             serving: None,
             held: Held::new(),
+            busy_reported: 0,
+            refusal_reported: None,
             accept: Some(accept),
         })
     }
@@ -715,13 +786,15 @@ impl Listener {
     /// oldest half-open reader. A newcomer that would need a healthy writer
     /// evicted is closed instead — a reply in flight outranks a request not
     /// yet read.
-    fn admit_connected(&mut self, now: Instant) {
+    fn admit_connected(&mut self, now: Instant) -> io::Result<()> {
         for _ in 0..ACCEPT_PER_TICK {
             let handle = match self.accept.as_ref().map(|a| a.rx.try_recv()) {
-                Some(Ok(SendHandle(h))) => h,
-                Some(Err(TryRecvError::Empty)) | Some(Err(TryRecvError::Disconnected)) | None => {
-                    return
-                }
+                Some(Ok(sh)) => sh.into_inner(),
+                Some(Err(TryRecvError::Empty)) | None => return Ok(()),
+                // The thread is gone: nothing will ever arrive again and the
+                // endpoint is deaf. The host must hear that, every poll,
+                // rather than take silence for an idle channel.
+                Some(Err(TryRecvError::Disconnected)) => return Err(accept_thread_gone()),
             };
             if self.instances.len() >= POOL_MAX {
                 let victim = self
@@ -766,6 +839,36 @@ impl Listener {
                 chan: Channel::new(PipeConn { handle }, now),
             });
         }
+        Ok(())
+    }
+
+    /// Clients the accept thread turned away at the door (the hand-over was
+    /// full) since bind. Diagnostics and tests.
+    pub fn refused_at_door(&self) -> usize {
+        self.accept
+            .as_ref()
+            .map_or(0, |a| a.busy.load(Ordering::Relaxed))
+    }
+
+    /// Report clients turned away at the door at most once per
+    /// [`REFUSAL_REPORT_EVERY`] — counted on the thread, printed here, so the
+    /// terminal write is bounded whatever the connect rate.
+    fn report_refusals(&mut self, now: Instant) {
+        let busy = self.refused_at_door();
+        if busy == self.busy_reported {
+            return;
+        }
+        let due = match self.refusal_reported {
+            None => true,
+            Some(t) => expired(t, now, REFUSAL_REPORT_EVERY),
+        };
+        if !due {
+            return;
+        }
+        let turned_away = busy - self.busy_reported;
+        self.busy_reported = busy;
+        self.refusal_reported = Some(now);
+        eprint!("[ipc] turned {turned_away} client(s) away at a full door\r\n");
     }
 
     /// How many requests are held for a later answer. Tests and diagnostics.
@@ -903,7 +1006,8 @@ impl Listener {
         // Attach any waiting client to a free instance: the ones the accept
         // thread connected, or — with the fixed pool — whoever is on an idle
         // instance (no instance is ever idle in accept-thread mode).
-        self.admit_connected(now);
+        self.admit_connected(now)?;
+        self.report_refusals(now);
         for i in 0..self.instances.len() {
             if self.instances[i].phase != Phase::Idle {
                 continue;

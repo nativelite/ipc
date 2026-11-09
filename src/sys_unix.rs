@@ -4,10 +4,10 @@
 use super::chan::{Channel, Conn, ReadOutcome, Recv, Sent, WriteOutcome};
 use super::hold::{Held, Ticket};
 use super::wire::{
-    expired, reply_too_large, ACCEPT_PER_TICK, ACCEPT_RETRY, CLIENT_POLL, DRAIN_DEADLINE,
-    DRAIN_GRACE, ENDPOINT_CHECK_EVERY, HOLD_EXPIRED_REPLY, HOLD_FULL_REPLY, MAX_LINGER, MAX_OUTBOX,
-    MAX_REPLY, MAX_SLOTS, OVERSIZE_REPLY, REFUSAL_REPORT_EVERY, REPLY_DEADLINE, REPLY_STALL,
-    TOO_LARGE_REPLY,
+    expired, reply_too_large, ACCEPT_PER_TICK, ACCEPT_RETRY, BUSY_REPLY, CLIENT_POLL,
+    DRAIN_DEADLINE, DRAIN_GRACE, ENDPOINT_CHECK_EVERY, HANDOVER_CAP, HOLD_EXPIRED_REPLY,
+    HOLD_FULL_REPLY, MAX_LINGER, MAX_OUTBOX, MAX_REPLY, MAX_SLOTS, OVERSIZE_REPLY,
+    REFUSAL_REPORT_EVERY, REPLY_DEADLINE, REPLY_STALL, STOP_JOIN_UNIX, STOP_POLL, TOO_LARGE_REPLY,
 };
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
@@ -15,8 +15,8 @@ use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -29,18 +29,31 @@ extern "C" {
 /// `SHUT_RDWR`: the same value on Linux, Android, macOS and the BSDs.
 const SHUT_RDWR: i32 = 2;
 
+/// What `poll` returns once the accept thread has exited: the endpoint takes
+/// no more clients, and a host that keeps polling would otherwise never know.
+fn accept_thread_gone() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Other,
+        "the ctl accept thread has exited; the endpoint accepts no more clients",
+    )
+}
+
 /// The waker a [`Listener::bind_waking`] accept thread rings on each connect.
 pub type Wake = Box<dyn Fn() + Send + Sync + 'static>;
 
-/// The accept thread and the channel it hands accepted streams over.
+/// The accept thread and the bounded channel it hands accepted streams over.
 ///
 /// `accept(2)` is the one call in this transport that can wait, so it gets a
 /// thread of its own: the thread blocks on the listening socket, forwards each
 /// accepted stream to the run loop over `rx`, rings the waker, and blocks
-/// again. Nothing else moves: the peer-uid gate, the slot pool and its
-/// eviction all still run in [`Listener::accept_new`] on the run loop, on the
-/// stream the thread forwarded instead of one `accept` returned — so the
-/// refusal path and its counters behave exactly as before.
+/// again. The peer-uid gate, the slot pool and its eviction still run in
+/// [`Listener::accept_new`] on the run loop, on the stream the thread
+/// forwarded instead of one `accept` returned. The one refusal the thread
+/// makes itself is at the door: the hand-over holds at most [`HANDOVER_CAP`]
+/// streams the loop has not taken yet (the kernel backlog used to be that
+/// bound), and a client past it is answered [`BUSY_REPLY`] and closed at once,
+/// counted in `busy` and reported by `report_refusals` with the credential
+/// refusals, at the same bounded rate.
 ///
 /// `O_NONBLOCK` is a property of the open file description, shared by every
 /// dup of the socket, so the listener is set blocking as a whole and the run
@@ -48,6 +61,8 @@ pub type Wake = Box<dyn Fn() + Send + Sync + 'static>;
 struct Acceptor {
     rx: Receiver<UnixStream>,
     stop: Arc<AtomicBool>,
+    /// Clients turned away at the door since the last report.
+    busy: Arc<AtomicUsize>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -55,26 +70,34 @@ impl Acceptor {
     fn start(listener: &UnixListener, wake: Wake) -> io::Result<Acceptor> {
         let dup = listener.try_clone()?;
         dup.set_nonblocking(false)?;
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(HANDOVER_CAP);
         let stop = Arc::new(AtomicBool::new(false));
-        let flag = Arc::clone(&stop);
+        let busy = Arc::new(AtomicUsize::new(0));
+        let (flag, counter) = (Arc::clone(&stop), Arc::clone(&busy));
         let thread = thread::Builder::new()
             .name("ipc-accept".to_string())
-            .spawn(move || accept_loop(dup, tx, wake, flag))?;
+            .spawn(move || accept_loop(dup, tx, wake, flag, counter))?;
         Ok(Acceptor {
             rx,
             stop,
+            busy,
             thread: Some(thread),
         })
     }
 
-    /// Ask the thread to leave and wait for it, briefly. `shutdown(2)` on the
-    /// listening socket wakes a blocked `accept` on Linux; where it does not
-    /// (macOS reports `ENOTCONN` and the wait stands), a connect to our own
-    /// path does. Both are attempted, and the join is bounded by a spin count
-    /// rather than a clock, so a thread that cannot be woken (the path was
-    /// taken over by another socket) is left to die with the process instead
-    /// of hanging the drop.
+    /// Ask the thread to leave and wait for it, for at most [`STOP_JOIN_UNIX`].
+    /// `shutdown(2)` on the listening socket wakes a blocked `accept` on Linux;
+    /// where it does not (macOS reports `ENOTCONN` and the wait stands), a
+    /// connect to our own path does. Both are attempted. A thread that cannot
+    /// be woken (the path was taken over by another socket) is detached past
+    /// the deadline and dies with the process rather than hanging the drop.
+    /// Streams still in the hand-over are dropped here, so their clients see
+    /// EOF rather than a connection nobody will ever read.
+    ///
+    /// The thread checks the stop flag immediately before ringing, so at most
+    /// one ring can land after the listener is gone — when the check and the
+    /// drop interleave just so. A waker must be harmless then (a doorbell
+    /// `try_send` into a dropped or empty slot is).
     fn stop(&mut self, fd: i32, path: &Path) {
         self.stop.store(true, Ordering::SeqCst);
         // SAFETY: `fd` is the listener's open descriptor, borrowed for the
@@ -82,22 +105,29 @@ impl Acceptor {
         // harmlessly, and either way touches nothing but that socket.
         unsafe { shutdown(fd, SHUT_RDWR) };
         let _ = UnixStream::connect(path);
-        let Some(thread) = self.thread.take() else {
-            return;
-        };
-        for _ in 0..1_000 {
+        if let Some(thread) = self.thread.take() {
+            let deadline = Instant::now() + STOP_JOIN_UNIX;
+            while !thread.is_finished() && Instant::now() < deadline {
+                thread::sleep(STOP_POLL);
+            }
             if thread.is_finished() {
                 let _ = thread.join();
-                return;
+            } else {
+                eprint!("[ipc] the accept thread did not stop in time; detached\r\n");
             }
-            thread::yield_now();
         }
-        // Still blocked: detach. The thread holds only its dup of the socket.
+        while self.rx.try_recv().is_ok() {}
     }
 }
 
 /// The accept thread's body: block, forward, ring, repeat, until told to stop.
-fn accept_loop(listener: UnixListener, tx: Sender<UnixStream>, wake: Wake, stop: Arc<AtomicBool>) {
+fn accept_loop(
+    listener: UnixListener,
+    tx: SyncSender<UnixStream>,
+    wake: Wake,
+    stop: Arc<AtomicBool>,
+    busy: Arc<AtomicUsize>,
+) {
     loop {
         if stop.load(Ordering::SeqCst) {
             return;
@@ -107,10 +137,24 @@ fn accept_loop(listener: UnixListener, tx: Sender<UnixStream>, wake: Wake, stop:
                 if stop.load(Ordering::SeqCst) {
                     return;
                 }
-                if tx.send(stream).is_err() {
-                    return; // the Listener is gone
+                match tx.try_send(stream) {
+                    Ok(()) => {}
+                    Err(TrySendError::Full(stream)) => {
+                        // The loop has not taken what it was handed: turn this
+                        // one away at the door, with the reason where the
+                        // close delivers it. One non-blocking write, no wait.
+                        busy.fetch_add(1, Ordering::Relaxed);
+                        refuse_busy(stream);
+                        continue;
+                    }
+                    Err(TrySendError::Disconnected(_)) => return, // the Listener is gone
                 }
-                wake();
+                if stop.load(Ordering::SeqCst) {
+                    return;
+                }
+                // A waker that panics must not take acceptance down with it:
+                // the thread is the only path clients have in.
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(&wake));
             }
             Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
             // EMFILE, ECONNABORTED, the socket shut down from `Drop`: the
@@ -123,6 +167,17 @@ fn accept_loop(listener: UnixListener, tx: Sender<UnixStream>, wake: Wake, stop:
                 thread::sleep(ACCEPT_RETRY);
             }
         }
+    }
+}
+
+/// Tell a client turned away at the door why, and close. The stream is still
+/// blocking here; it is switched first so the write cannot wait, and whatever
+/// the kernel declines to take is simply not said.
+fn refuse_busy(mut stream: UnixStream) {
+    if stream.set_nonblocking(true).is_ok() {
+        let mut line = BUSY_REPLY.as_bytes().to_vec();
+        line.push(b'\n');
+        let _ = stream.write(&line);
     }
 }
 
@@ -246,6 +301,8 @@ pub struct Listener {
     /// terminal write whose rate is chosen by whoever is connecting.
     refused: usize,
     refusal_reported: Option<Instant>,
+    /// How many door refusals (`Acceptor::busy`) the last report covered.
+    busy_reported: usize,
     /// Replies still being handed to the kernel a buffer at a time. The flag
     /// marks a *refused* client, which atrium keeps draining until it hangs up
     /// so the refusal is not lost to a reset (see `Channel::drain_input`).
@@ -343,6 +400,7 @@ impl Listener {
             cur: None,
             refused: 0,
             refusal_reported: None,
+            busy_reported: 0,
             outbox: VecDeque::new(),
             held: Held::new(),
             accept,
@@ -553,9 +611,24 @@ impl Listener {
         true
     }
 
-    /// Report refused peers at most once per [`REFUSAL_REPORT_EVERY`].
+    /// Clients the accept thread turned away at the door (the hand-over was
+    /// full) since bind. Diagnostics and tests.
+    pub fn refused_at_door(&self) -> usize {
+        self.accept
+            .as_ref()
+            .map_or(0, |a| a.busy.load(Ordering::Relaxed))
+    }
+
+    /// Report refused peers at most once per [`REFUSAL_REPORT_EVERY`]: those
+    /// the credential gate turned away, and those the accept thread turned away
+    /// at a full door, in one line.
     fn report_refusals(&mut self, now: Instant) {
-        if self.refused == 0 {
+        let busy = self
+            .accept
+            .as_ref()
+            .map_or(0, |a| a.busy.load(Ordering::Relaxed));
+        let reported_busy = self.busy_reported;
+        if self.refused == 0 && busy == reported_busy {
             return;
         }
         let due = match self.refusal_reported {
@@ -566,8 +639,13 @@ impl Listener {
             return;
         }
         let n = std::mem::take(&mut self.refused);
+        let turned_away = busy - reported_busy;
+        self.busy_reported = busy;
         self.refusal_reported = Some(now);
-        eprint!("[ipc] refused {n} peer(s) the server could not vouch for\r\n");
+        eprint!(
+            "[ipc] refused {n} peer(s) the server could not vouch for, \
+             {turned_away} at a full door\r\n"
+        );
     }
 
     /// Accept whoever is waiting, up to a few per tick.
@@ -584,10 +662,10 @@ impl Listener {
                 Some(a) => match a.rx.try_recv() {
                     Ok(stream) => Ok((stream, ())),
                     Err(TryRecvError::Empty) => return Ok(()),
-                    // The thread is gone (it cannot be, short of a panic);
-                    // nothing more will ever arrive, which is idle, not an
-                    // error the run loop should see every tick.
-                    Err(TryRecvError::Disconnected) => return Ok(()),
+                    // The thread is gone: nothing will ever arrive again and
+                    // the endpoint is deaf. The host must hear that, every
+                    // poll, rather than take silence for an idle channel.
+                    Err(TryRecvError::Disconnected) => return Err(accept_thread_gone()),
                 },
                 None => self.listener.accept().map(|(s, _)| (s, ())),
             };
