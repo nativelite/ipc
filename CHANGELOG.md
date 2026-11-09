@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **The never-reads test no longer races the scheduler** (atrium issue #9).
+  `neither_poll_nor_respond_waits_on_a_client_that_never_reads` asserted that
+  every `poll` and `respond` returned inside 50 ms, which a parallel cargo
+  build on the same box could fail with nothing blocking. The property is
+  now proven by shape: after `respond` the tail of the (4 MiB) reply is
+  parked (`outbox_len() == 1`), where a call that waited on the client would
+  have returned with nothing parked or never returned; the per-call bound is
+  1 s, which only a wait on the peer can exceed, and the 20 ms tick budget
+  is measured and printed, not asserted. Test only; no crate behaviour
+  changed.
+
 ## [0.2.0] - 2026-11-08
 
 ### Fixed (review of the accept thread, before release)

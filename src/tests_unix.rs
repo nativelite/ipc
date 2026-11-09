@@ -879,13 +879,24 @@ fn neither_poll_nor_respond_waits_on_a_client_that_never_reads() {
     deaf.write_all(b"{\"cmd\":\"audit\"}\n").expect("write");
     deaf.flush().ok();
 
-    // Far more than the ~8 KiB macOS send buffer, so the kernel refuses the
-    // tail and the reply MUST be parked rather than waited on.
-    let reply = format!("{{\"ok\":true,\"pad\":\"{}\"}}", "z".repeat(400_000));
+    // Far more than any unix-socket send buffer (Linux's default is ~208 KiB,
+    // macOS's ~8 KiB; MAX_REPLY is 8 MiB), so the kernel refuses the tail and
+    // the reply MUST be parked rather than waited on.
+    let reply = format!("{{\"ok\":true,\"pad\":\"{}\"}}", "z".repeat(4 << 20));
 
-    let budget = Duration::from_millis(50);
+    // The proof is not a stopwatch. A call that waited on this client would
+    // wait forever (it never reads), so the per-call bound only has to be one
+    // that scheduler noise cannot reach and a wait on the peer cannot meet:
+    // 1 s, a fifth of WRITE_STALL. The 50 ms bound this used to assert failed
+    // one Linux run in four under a parallel cargo build with nothing
+    // blocking (atrium issue #9). The 20 ms tick budget is measured and
+    // printed, not asserted; what IS asserted is the deterministic shape of a
+    // non-blocking respond: it returns with the tail parked.
+    let budget = Duration::from_secs(1);
+    let tick = Duration::from_millis(20);
     let mut worst_poll = Duration::ZERO;
     let mut worst_respond = Duration::ZERO;
+    let mut over_tick = 0u32;
     let mut served = false;
 
     // Run past WRITE_STALL so the give-up path is exercised too, not just
@@ -894,20 +905,30 @@ fn neither_poll_nor_respond_waits_on_a_client_that_never_reads() {
     while Instant::now() < deadline {
         let t = Instant::now();
         let got = server.poll().expect("poll");
-        worst_poll = worst_poll.max(t.elapsed());
+        let took = t.elapsed();
+        worst_poll = worst_poll.max(took);
+        over_tick += u32::from(took > tick);
         assert!(
-            t.elapsed() < budget,
-            "poll() waited {:?} on a client that never reads",
-            t.elapsed()
+            took < budget,
+            "poll() waited {took:?} on a client that never reads"
         );
         if got.is_some() {
             let t = Instant::now();
             server.respond(&reply).expect("respond");
-            worst_respond = worst_respond.max(t.elapsed());
+            let took = t.elapsed();
+            worst_respond = worst_respond.max(took);
+            over_tick += u32::from(took > tick);
             assert!(
-                t.elapsed() < budget,
-                "respond() waited {:?} on a client that never reads",
-                t.elapsed()
+                took < budget,
+                "respond() waited {took:?} on a client that never reads"
+            );
+            // The kernel took what it would and the rest was parked. A
+            // respond that had waited for the client to read would have come
+            // back with nothing left to drain - or never.
+            assert_eq!(
+                server.outbox_len(),
+                1,
+                "the tail of the reply is parked, not waited on"
             );
             served = true;
         }
@@ -921,7 +942,10 @@ fn neither_poll_nor_respond_waits_on_a_client_that_never_reads() {
         "a reply to a client that never reads must be given up on at \
          WRITE_STALL, not held forever"
     );
-    eprintln!("PROOF non-blocking: worst poll {worst_poll:?}, worst respond {worst_respond:?}");
+    eprintln!(
+        "PROOF non-blocking: worst poll {worst_poll:?}, worst respond {worst_respond:?}, \
+         calls over the {tick:?} tick: {over_tick}"
+    );
     drop(deaf);
     let _ = std::fs::remove_file(&addr);
 }
