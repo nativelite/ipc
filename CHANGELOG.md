@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-11-15
+
+### Added
+- **`endpoint_live(addr) -> bool`**: is a server *accepting* at `addr`? On
+  unix one connect that sends nothing, so a socket file left by a crash says
+  no where `endpoint_exists` says yes; on Windows the same as
+  `endpoint_exists`. For a caller holding a recorded address (atrium's
+  discovery file) that must tell a running server from a dead one.
+
+### Fixed
+- **A bind no longer takes an address from a live server** (atrium issue #23).
+  On unix `bind` removed whatever was at the path before binding, which was
+  sound only while every address carried the binder's pid: with a path the
+  caller chooses it unlinked a running server's socket, and deleted any other
+  file the path named. It now refuses a path with a live listener
+  (`AddrInUse`), refuses a file that is not a socket (`AlreadyExists`, the
+  file untouched), and removes only a socket that refuses a connect, which is
+  what a crash leaves. On Windows the first-instance flag already refused a
+  second binder, as `ERROR_ACCESS_DENIED`; that is now reported as `AddrInUse`
+  with the address in the message. The 0600 mode, the peer check and the
+  SDDL are unchanged.
+
 ## [0.2.1] - 2026-11-09
 
 ### Added

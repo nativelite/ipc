@@ -112,8 +112,19 @@ pub struct Listener {
 }
 
 impl Listener {
-    /// Bind the control endpoint at `addr`. On unix a stale socket file at the
-    /// path is removed first; the socket file is unlinked on drop.
+    /// Bind the control endpoint at `addr`. The socket file is unlinked on
+    /// drop.
+    ///
+    /// An address a live server holds is refused with
+    /// [`io::ErrorKind::AddrInUse`] and nothing is taken from that server: on
+    /// unix its socket file stays (a connect to it succeeded), on Windows the
+    /// first-instance flag fails the create. On unix a *stale* socket file,
+    /// one that refuses a connect because the process that bound it is gone,
+    /// is removed and the path taken over; a file at the path that is not a
+    /// socket is refused (`AlreadyExists`) and never removed. Windows has no
+    /// stale case: a pipe name dies with its last instance. The check and the
+    /// bind are two steps, so two servers started on one path at the same
+    /// instant can still race; see the same-user note in the crate docs.
     pub fn bind(addr: &str) -> io::Result<Listener> {
         Ok(Listener {
             sys: sys::Listener::bind(addr)?,
@@ -284,6 +295,16 @@ pub fn request(addr: &str, req: &str) -> io::Result<String> {
 /// its server and wrong for a probe.
 pub fn endpoint_exists(addr: &str) -> bool {
     sys::endpoint_exists(addr)
+}
+
+/// Is a server *accepting* at `addr` right now? Where [`endpoint_exists`]
+/// says yes to a socket file a crashed server left behind, this says no. On
+/// unix it is one connect that sends nothing and closes (the server sheds it
+/// like any client that hangs up); on Windows it is [`endpoint_exists`],
+/// since a pipe name cannot outlive its server. What a caller uses to decide
+/// whether a recorded address still names a running server.
+pub fn endpoint_live(addr: &str) -> bool {
+    sys::endpoint_live(addr)
 }
 
 /// [`request`] for a verb the server may hold ([`Listener::park`]) for up to

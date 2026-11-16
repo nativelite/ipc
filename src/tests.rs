@@ -477,3 +477,56 @@ fn endpoint_exists_answers_without_connecting() {
     drop(listener);
     assert!(!endpoint_exists(&addr), "gone once the listener drops");
 }
+
+/// A second bind on an address a live server holds is refused, as
+/// `AddrInUse`, and takes nothing from the first: no unlink on unix, no
+/// second pipe instance on Windows. A stable, operator-chosen address makes
+/// this reachable; a per-pid one never was.
+#[test]
+fn a_bind_on_a_live_address_is_refused_and_the_first_server_keeps_serving() {
+    let addr = test_addr(9601);
+    let mut first = Listener::bind(&addr).expect("first bind");
+    for (what, second) in [
+        ("bind", Listener::bind(&addr)),
+        ("bind_waking", Listener::bind_waking(&addr, Box::new(|| {}))),
+    ] {
+        match second {
+            Ok(_) => panic!("{what} took an address with a live listener"),
+            Err(e) => assert_eq!(e.kind(), io::ErrorKind::AddrInUse, "{what}: {e}"),
+        }
+    }
+    assert!(
+        endpoint_live(&addr),
+        "the first server still holds the address"
+    );
+    let a = addr.clone();
+    let client = thread::spawn(move || request(&a, "still-there"));
+    let req = next_request(&mut first, 400).expect("the first server gets the request");
+    assert_eq!(req, "still-there");
+    first.respond("yes").expect("respond");
+    for _ in 0..50 {
+        let _ = first.poll();
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(client.join().unwrap().expect("reply"), "yes");
+}
+
+/// `endpoint_live` follows the listener's life, and a waking listener is
+/// refused the same way a polling one is.
+#[test]
+fn endpoint_live_follows_the_listener_and_the_address_is_free_after_a_drop() {
+    let addr = test_addr(9602);
+    assert!(!endpoint_live(&addr), "nothing bound yet");
+    let waking = Listener::bind_waking(&addr, Box::new(|| {})).expect("bind_waking");
+    assert!(endpoint_live(&addr), "a bound endpoint answers");
+    let second = Listener::bind(&addr);
+    assert_eq!(
+        second.err().map(|e| e.kind()),
+        Some(io::ErrorKind::AddrInUse),
+        "a waking listener's address is refused too"
+    );
+    drop(waking);
+    assert!(!endpoint_live(&addr), "gone once the listener drops");
+    let again = Listener::bind(&addr).expect("the address is free again");
+    drop(again);
+}

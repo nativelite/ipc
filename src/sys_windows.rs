@@ -317,6 +317,7 @@ const GENERIC_READ: u32 = 0x8000_0000;
 const GENERIC_WRITE: u32 = 0x4000_0000;
 const OPEN_EXISTING: u32 = 3;
 const ERROR_FILE_NOT_FOUND: i32 = 2;
+const ERROR_ACCESS_DENIED: i32 = 5;
 /// `WaitNamedPipeW`: return at once.
 const NMPWAIT_NOWAIT: u32 = 1;
 const ERROR_PIPE_BUSY: i32 = 231;
@@ -715,6 +716,7 @@ impl Listener {
     }
 
     pub fn bind(addr: &str) -> io::Result<Listener> {
+        let name = addr;
         let addr = wide(addr);
         let now = Instant::now();
         // The first instance must succeed (it also claims the name); the rest
@@ -727,7 +729,7 @@ impl Listener {
                     phase: Phase::Idle,
                     chan: Channel::new(PipeConn { handle }, now),
                 }),
-                Err(e) if i == 0 => return Err(e),
+                Err(e) if i == 0 => return Err(claim_error(name, e)),
                 Err(_) => break,
             }
         }
@@ -746,8 +748,9 @@ impl Listener {
     /// `FILE_FLAG_FIRST_PIPE_INSTANCE`); it is the thread's, blocking, and the
     /// pool starts empty and holds only connected clients.
     pub fn bind_waking(addr: &str, wake: Wake) -> io::Result<Listener> {
+        let name = addr;
         let addr = wide(addr);
-        let first = Self::create_instance(&addr, true, false)?;
+        let first = Self::create_instance(&addr, true, false).map_err(|e| claim_error(name, e))?;
         // On failure the thread closure, and the `SendHandle` owning `first`
         // inside it, were dropped by `spawn`: the instance is already closed.
         let accept = Acceptor::start(addr, first, wake)?;
@@ -1158,6 +1161,28 @@ pub fn endpoint_exists(addr: &str) -> bool {
         return true;
     }
     io::Error::last_os_error().raw_os_error() != Some(ERROR_FILE_NOT_FOUND)
+}
+
+/// Is a server accepting on `addr` right now? A named pipe's name lives only
+/// as long as a process holds an instance of it, so there is no stale case to
+/// tell apart: this is [`endpoint_exists`].
+pub fn endpoint_live(addr: &str) -> bool {
+    endpoint_exists(addr)
+}
+
+/// Name the one first-instance failure a caller can act on. With
+/// `FILE_FLAG_FIRST_PIPE_INSTANCE` a name that already has an instance fails
+/// the create with `ERROR_ACCESS_DENIED`, which reads as a permissions fault;
+/// when the name does exist, say what happened instead: `AddrInUse`, the same
+/// kind the unix bind reports for a live socket.
+fn claim_error(addr: &str, e: io::Error) -> io::Error {
+    if e.raw_os_error() == Some(ERROR_ACCESS_DENIED) && endpoint_exists(addr) {
+        return io::Error::new(
+            io::ErrorKind::AddrInUse,
+            format!("a server is already listening on {addr}"),
+        );
+    }
+    e
 }
 
 /// A request the server may hold for up to `hold` before answering: the

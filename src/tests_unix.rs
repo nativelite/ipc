@@ -1043,3 +1043,81 @@ fn thousands_of_stall_and_abandon_cycles_leak_no_fds_or_slots() {
     );
     let _ = std::fs::remove_file(&addr);
 }
+
+/// **A stale socket file is taken over.** A server that crashed leaves its
+/// socket file behind with nobody listening: a connect is refused, so the
+/// next bind on that path removes the file and serves there.
+#[test]
+fn a_stale_socket_file_is_taken_over() {
+    let addr = test_addr(9611);
+    let _ = std::fs::remove_file(&addr);
+    // std's listener does not unlink on drop: exactly what a crash leaves.
+    drop(std::os::unix::net::UnixListener::bind(&addr).expect("the crashed server's bind"));
+    assert!(endpoint_exists(&addr), "the file is still there");
+    assert!(!endpoint_live(&addr), "and nobody answers on it");
+    let mut server = Listener::bind(&addr).expect("a stale socket is taken over");
+    assert!(endpoint_live(&addr));
+    let a = addr.clone();
+    let client = thread::spawn(move || request(&a, "hello"));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let req = loop {
+        if let Some(r) = server.poll().expect("poll") {
+            break r;
+        }
+        assert!(Instant::now() < deadline, "no request arrived");
+        thread::sleep(Duration::from_millis(5));
+    };
+    assert_eq!(req, "hello");
+    server.respond("hi").expect("respond");
+    while !client.is_finished() {
+        let _ = server.poll();
+        assert!(Instant::now() < deadline, "the client never finished");
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(client.join().unwrap().expect("reply"), "hi");
+}
+
+/// **A live server's socket is not unlinked by a second bind.** The bind used
+/// to remove whatever was at the path first; with a caller-chosen path that
+/// took a running server's endpoint away from it. The file must be the same
+/// `(dev, ino)` afterwards and raise no tripwire.
+#[test]
+fn a_refused_bind_leaves_the_live_socket_file_in_place() {
+    use std::os::unix::fs::MetadataExt;
+    let addr = test_addr(9612);
+    let mut first = Listener::bind(&addr).expect("first bind");
+    let before = std::fs::metadata(&addr)
+        .map(|m| (m.dev(), m.ino()))
+        .unwrap();
+    let second = Listener::bind(&addr);
+    assert_eq!(
+        second.err().map(|e| e.kind()),
+        Some(io::ErrorKind::AddrInUse)
+    );
+    let after = std::fs::metadata(&addr)
+        .map(|m| (m.dev(), m.ino()))
+        .unwrap();
+    assert_eq!(before, after, "the live socket file was replaced");
+    // The probe was one connection that said nothing: the pool sheds it.
+    for _ in 0..20 {
+        assert_eq!(first.poll().expect("poll"), None);
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(first.take_security_event(), None);
+}
+
+/// **A file that is not a socket is never removed.** The path is the
+/// caller's to choose now, so a typo must not delete a regular file.
+#[test]
+fn a_bind_over_a_regular_file_is_refused_and_the_file_survives() {
+    let addr = test_addr(9613);
+    std::fs::write(&addr, b"not a socket").unwrap();
+    let got = Listener::bind(&addr);
+    assert_eq!(
+        got.err().map(|e| e.kind()),
+        Some(io::ErrorKind::AlreadyExists)
+    );
+    assert_eq!(std::fs::read(&addr).unwrap(), b"not a socket");
+    assert!(!endpoint_live(&addr));
+    let _ = std::fs::remove_file(&addr);
+}

@@ -275,6 +275,58 @@ fn socket_ident(path: &Path) -> Option<(u64, u64)> {
     std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
 }
 
+/// Make way for a bind at `path`, without taking the path from a server
+/// that is still serving on it.
+///
+/// The bind used to unlink whatever was there first. That was sound while
+/// every address carried the binder's own pid; with an address the caller
+/// chooses it unlinked a running server's socket from under it, and removed
+/// any other file a mistyped path happened to name. So, in order: nothing
+/// there is fine; something that is not a socket is refused and left alone
+/// (a symlink included: it is not followed); a socket that accepts a connect
+/// has a live server and is refused as `AddrInUse`; a socket that refuses one
+/// is what a crash leaves, and is removed.
+///
+/// The probe is one connection that sends nothing and closes, which the live
+/// server's pool sheds like any client that hangs up. Between the probe and
+/// the unlink another same-user process could bind the path; that race is the
+/// same-user non-goal the crate documents, and the loser's tripwire fires.
+fn clear_stale(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::FileTypeExt;
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    if !meta.file_type().is_socket() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "refusing to bind {}: a file that is not a socket is already there",
+                path.display()
+            ),
+        ));
+    }
+    match UnixStream::connect(path) {
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            format!("a server is already listening on {}", path.display()),
+        )),
+        Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
+            let _ = std::fs::remove_file(path);
+            Ok(())
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(io::Error::new(
+            e.kind(),
+            format!(
+                "refusing to replace {}: cannot tell whether a server is listening there ({e})",
+                path.display()
+            ),
+        )),
+    }
+}
+
 pub struct Listener {
     listener: UnixListener,
     path: PathBuf,
@@ -348,8 +400,9 @@ impl Listener {
                 ),
             ));
         }
-        // A stale socket file from a crashed prior run would block the bind.
-        let _ = std::fs::remove_file(&path);
+        // A stale socket file from a crashed prior run would block the bind;
+        // a live server's must stay where it is.
+        clear_stale(&path)?;
         let listener = UnixListener::bind(&path)?;
         listener.set_nonblocking(true)?;
         // Owner-only (0600) so the socket file itself is not connectable by
@@ -840,6 +893,12 @@ pub fn endpoint_exists(addr: &str) -> bool {
     std::fs::metadata(addr)
         .map(|m| m.file_type().is_socket())
         .unwrap_or(false)
+}
+
+/// Is a server accepting on `addr` right now? One connect that sends nothing
+/// and closes: a stale socket file refuses it, a live listener takes it.
+pub fn endpoint_live(addr: &str) -> bool {
+    UnixStream::connect(addr).is_ok()
 }
 
 /// A request the server may hold for up to `hold` before answering: the
